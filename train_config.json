@@ -1,0 +1,62 @@
+{
+  "datasets": {
+    "emotion_en": {
+      "source": "huggingface",
+      "dataset_id": "emotion",
+      "split": "train",
+      "text_keys": ["text"],
+      "label_keys": ["label"],
+      "label_map": {
+        "0": "sadness",
+        "1": "joy",
+        "2": "love",
+        "3": "anger",
+        "4": "fear",
+        "5": "surprise"
+      },
+      "max_samples": 5000,
+      "description": "英文情感分类 (sadness/joy/love/anger/fear/surprise)"
+    },
+    "sentiment_multi": {
+      "source": "huggingface",
+      "dataset_id": "tyqiangz/multilingual-sentiments",
+      "subset": "chinese",
+      "split": "train",
+      "text_keys": ["text"],
+      "label_keys": ["label"],
+      "label_map": {
+        "0": "positive",
+        "1": "neutral",
+        "2": "negative"
+      },
+      "max_samples": 8000,
+      "description": "中文情感分析 (positive/neutral/negative)"
+    },
+    "belle_dialogue": {
+      "source": "modelscope",
+      "dataset_id": "Belle/Belle-3-5M",
+      "split": "train",
+      "text_keys": ["instruction", "input"],
+      "label_keys": ["output"],
+      "max_samples": 10000,
+      "description": "中文对话指令数据集 (BELLE)"
+    },
+    "local_custom": {
+      "source": "file",
+      "dataset_id": "data/datasets/custom.json",
+      "description": "本地自定义数据集 (JSON/JSONL)"
+    }
+  },
+
+  "training": {
+    "epochs": 50,
+    "batch_size": 64,
+    "lr": 0.005,
+    "val_split": 0.15,
+    "early_stop_patience": 5,
+    "merge_seed": true
+  },
+
+  "active_dataset": null,
+  "notes": "设置 active_dataset 为上面某个 key 即可使用。运行 python train.py --list 查看可用数据集。"
+}

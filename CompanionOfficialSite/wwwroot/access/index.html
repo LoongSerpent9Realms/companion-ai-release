@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>访问方式 - 智能伙伴</title>
+  <link rel="stylesheet" href="/asset/detail.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="智能伙伴官网">
+      <img src="/asset/pet_icon.ico" alt="">
+      <span>智能伙伴</span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a href="/privacy/">隐私架构</a>
+      <a href="/features/">能力</a>
+      <a class="active" href="/access/">手机访问</a>
+      <a href="/">控制台</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="detail-hero">
+      <div>
+        <span class="eyebrow">安装与访问</span>
+        <h1>下载安装到电脑，本机节点启动后手机也能浏览。</h1>
+        <p class="lead">默认只监听本机。需要手机访问时，使用 LAN 启动方式显式打开局域网地址；需要外网访问时，再接入加密隧道或自建中继。</p>
+        <div class="button-row">
+          <a class="button primary" id="localOpenButton" href="/">检测本机 AI...</a>
+          <a class="button" id="downloadButton" href="/download/windows">下载安装包</a>
+        </div>
+      </div>
+      <aside class="hero-panel">
+        <div class="mini-stat"><strong>本机</strong><span>http://127.0.0.1:59137</span></div>
+        <div class="mini-stat"><strong>局域网</strong><span>同一 Wi-Fi 下用电脑 IP 访问</span></div>
+        <div class="mini-stat"><strong>外网</strong><span>Tailscale、Cloudflare Tunnel 或自建中继</span></div>
+      </aside>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>当前本地节点</h2>
+        <p>页面会尝试探测本机运行的智能伙伴服务。检测成功后，下面会显示控制台和手机访问地址。</p>
+      </div>
+      <div class="grid two">
+        <article class="card">
+          <span class="tag">连接状态</span>
+          <h3>服务探测</h3>
+          <p id="modeText">正在读取本地服务状态...</p>
+          <p id="redirectText"></p>
+          <div class="code-list" id="accessList"></div>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>访问路径</h2>
+        <p>按安全范围从小到大启用，够用即可。</p>
+      </div>
+      <div class="wide-panel">
+        <div class="step"><strong>本机控制台</strong><div><p>安装并启动后，在电脑浏览器打开本地地址，适合日常聊天、训练和插件管理。</p></div></div>
+        <div class="step"><strong>手机访问</strong><div><p>运行 LAN 启动脚本，同一 Wi-Fi 下用手机浏览器打开显示的局域网地址。</p></div></div>
+        <div class="step"><strong>外网访问</strong><div><p>使用 Tailscale、Cloudflare Tunnel 或自建加密中继，避免直接暴露本地服务端口。</p></div></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">智能伙伴 · 访问方式</footer>
+
+  <script>
+    const modeText = document.querySelector("#modeText");
+    const redirectText = document.querySelector("#redirectText");
+    const accessList = document.querySelector("#accessList");
+    const localOpenButton = document.querySelector("#localOpenButton");
+    const downloadButton = document.querySelector("#downloadButton");
+    const LOCAL_PORTS = [59137, 59138, 59139];
+    const LOCAL_HOSTS = ["127.0.0.1", "localhost"];
+
+    function isLoopbackHost(hostname) {
+      return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+    }
+
+    function withTimeout(promise, ms) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), ms);
+      return promise(controller.signal).finally(() => clearTimeout(timer));
+    }
+
+    async function probeAccess(url) {
+      const endpoint = url.replace(/\/$/, "") + "/api/local_access";
+      return withTimeout((signal) => fetch(endpoint, { method: "GET", mode: "cors", signal }), 900)
+        .then((res) => {
+          if (!res.ok) throw new Error("bad status");
+          return res.json();
+        })
+        .then((info) => ({ info, baseUrl: url.replace(/\/$/, "") }));
+    }
+
+    async function detectLocalCompanion() {
+      const currentBase = window.location.origin;
+      const candidates = [];
+      if (isLoopbackHost(window.location.hostname)) {
+        candidates.push(currentBase);
+      }
+      LOCAL_PORTS.forEach((port) => {
+        LOCAL_HOSTS.forEach((host) => candidates.push(`http://${host}:${port}`));
+      });
+      const unique = [...new Set(candidates)];
+      for (const url of unique) {
+        try {
+          return await probeAccess(url);
+        } catch (err) {
+          // Try the next local endpoint.
+        }
+      }
+      return null;
+    }
+
+    function addCode(text) {
+      const code = document.createElement("code");
+      code.textContent = text;
+      accessList.appendChild(code);
+    }
+
+    detectLocalCompanion().then((detected) => {
+      if (!detected) {
+        modeText.textContent = "未检测到本机智能伙伴。请先下载安装并启动本地程序。";
+        redirectText.textContent = "安装后刷新本页，官网会自动发现本机节点。";
+        localOpenButton.textContent = "下载并安装";
+        localOpenButton.href = "/download/windows";
+        downloadButton.style.display = "inline-flex";
+        addCode("检测地址：http://127.0.0.1:59137");
+        return;
+      }
+
+      const { info, baseUrl } = detected;
+      const lan = info.mode === "lan";
+      const consoleUrl = baseUrl + "/";
+      modeText.textContent = lan
+        ? "已检测到本机智能伙伴，且局域网访问已开启。"
+        : "已检测到本机智能伙伴。控制台会连接你的本地程序，训练数据继续保存在本机。";
+      localOpenButton.textContent = "打开本地控制台";
+      localOpenButton.href = consoleUrl;
+      downloadButton.textContent = "重新安装/更新";
+      addCode("本地控制台：" + consoleUrl);
+      if (lan && info.lan_urls && info.lan_urls.length) {
+        info.lan_urls.forEach((url) => addCode("手机访问：" + url));
+      } else {
+        addCode("手机访问：开启 LAN 模式后显示局域网地址");
+      }
+      redirectText.textContent = isLoopbackHost(window.location.hostname)
+        ? "当前页面已经来自本地服务，不会重复跳转。"
+        : "你可以手动进入本地控制台。";
+    });
+  </script>
+</body>
+</html>

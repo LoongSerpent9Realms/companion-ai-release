@@ -1,0 +1,146 @@
+{
+  "base_models": {
+    "qwen_1.8b": {
+      "id": "Qwen/Qwen1.5-1.8B-Chat",
+      "description": "Qwen 1.8B 对话模型 (推荐入门，约 4GB VRAM)",
+      "min_vram_gb": 4,
+      "size": "1.8B"
+    },
+    "qwen_4b": {
+      "id": "Qwen/Qwen1.5-4B-Chat",
+      "description": "Qwen 4B 对话模型 (平衡选择，约 8GB VRAM)",
+      "min_vram_gb": 8,
+      "size": "4B"
+    },
+    "qwen_7b": {
+      "id": "Qwen/Qwen1.5-7B-Chat",
+      "description": "Qwen 7B 对话模型 (高质量，需 16GB+ VRAM)",
+      "min_vram_gb": 16,
+      "size": "7B"
+    },
+    "chatglm3_6b": {
+      "id": "THUDM/chatglm3-6b",
+      "description": "ChatGLM3 6B (中文优秀，约 12GB VRAM)",
+      "min_vram_gb": 12,
+      "size": "6B"
+    },
+    "minicpm_2b": {
+      "id": "openbmb/MiniCPM-2B-dpo-bf16",
+      "description": "MiniCPM 2B (轻量高效，约 4GB VRAM)",
+      "min_vram_gb": 4,
+      "size": "2B"
+    }
+  },
+
+  "datasets": {
+    "belle_1m": {
+      "source": "huggingface",
+      "dataset_id": "BelleGroup/train_1M_CN",
+      "split": "train",
+      "instruction_keys": ["instruction"],
+      "input_keys": ["input"],
+      "output_keys": ["output"],
+      "max_samples": 100000,
+      "description": "BELLE 100万条中文指令数据"
+    },
+    "belle_0.5m": {
+      "source": "huggingface",
+      "dataset_id": "BelleGroup/train_0.5M_CN",
+      "split": "train",
+      "instruction_keys": ["instruction"],
+      "input_keys": ["input"],
+      "output_keys": ["output"],
+      "max_samples": 50000,
+      "description": "BELLE 50万条中文指令数据"
+    },
+    "alpaca_zh": {
+      "source": "huggingface",
+      "dataset_id": "shibing624/alpaca-zh",
+      "split": "train",
+      "instruction_keys": ["instruction"],
+      "input_keys": ["input"],
+      "output_keys": ["output"],
+      "max_samples": 50000,
+      "description": "Alpaca 中文指令数据"
+    },
+    "firefly": {
+      "source": "huggingface",
+      "dataset_id": "YeungNLP/firefly-train-1.1M",
+      "split": "train",
+      "instruction_keys": ["input"],
+      "input_keys": [],
+      "output_keys": ["target"],
+      "max_samples": 100000,
+      "description": "Firefly 112万条中文指令数据"
+    },
+    "webqa": {
+      "source": "huggingface",
+      "dataset_id": "suolyer/webqa",
+      "split": "train",
+      "instruction_keys": ["input"],
+      "input_keys": [],
+      "output_keys": ["output"],
+      "max_samples": 30000,
+      "description": "WebQA 中文问答数据"
+    },
+    "modelscope_belle": {
+      "source": "modelscope",
+      "dataset_id": "AI-ModelScope/Belle-3-5M",
+      "split": "train",
+      "instruction_keys": ["instruction"],
+      "input_keys": ["input"],
+      "output_keys": ["output"],
+      "max_samples": 100000,
+      "description": "ModelScope 镜像的 BELLE 数据 (国内下载更快)"
+    },
+    "local_file": {
+      "source": "file",
+      "dataset_id": "data/datasets/dialogue.json",
+      "instruction_keys": ["instruction", "question", "prompt"],
+      "input_keys": ["input", "context"],
+      "output_keys": ["output", "response", "answer"],
+      "description": "本地对话数据文件"
+    }
+  },
+
+  "training_presets": {
+    "quick_1.8b": {
+      "base_model": "Qwen/Qwen1.5-1.8B-Chat",
+      "epochs": 2,
+      "batch_size": 4,
+      "lr": 2e-4,
+      "lora_r": 16,
+      "max_samples": 10000,
+      "description": "快速训练 1.8B 模型 (约 30分钟)"
+    },
+    "standard_1.8b": {
+      "base_model": "Qwen/Qwen1.5-1.8B-Chat",
+      "epochs": 3,
+      "batch_size": 4,
+      "lr": 2e-4,
+      "lora_r": 32,
+      "max_samples": 50000,
+      "description": "标准训练 1.8B 模型 (约 2小时)"
+    },
+    "quality_4b": {
+      "base_model": "Qwen/Qwen1.5-4B-Chat",
+      "epochs": 3,
+      "batch_size": 2,
+      "lr": 1e-4,
+      "lora_r": 32,
+      "max_samples": 50000,
+      "description": "高质量训练 4B 模型 (约 4小时)"
+    },
+    "full_7b": {
+      "base_model": "Qwen/Qwen1.5-7B-Chat",
+      "epochs": 3,
+      "batch_size": 2,
+      "lr": 1e-4,
+      "lora_r": 64,
+      "max_samples": 100000,
+      "description": "完整训练 7B 模型 (需 16GB+ VRAM，约 8小时)"
+    }
+  },
+
+  "notes": "使用 train_llm.py 训练。推荐从 quick_1.8b 开始测试，确认 GPU 可用后再用更大模型。"
+}

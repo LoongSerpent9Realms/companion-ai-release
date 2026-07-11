@@ -1,0 +1,55 @@
+# User data and local runtime state
+data/
+data_dev/
+*.key
+*.pem
+*.pfx
+*.p12
+*.crt
+*.cer
+*.log
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Build output and generated installers
+build/
+dist/
+installer_output/
+release_assets/*.exe
+CompanionOfficialSite/wwwroot/download/*.exe
+release_builder_config.json
+*.spec.bak
+智能伙伴.spec
+
+# JavaScript and .NET generated dependencies/build output
+node_modules/
+CompanionOfficialSite/bin/
+CompanionOfficialSite/obj/
+
+# Local planning, IDE and agent metadata
+.planning/
+.trae/
+.agents/
+.codex/
+.vscode/
+.idea/
+一平方米旅行社/
+one_square_meter_travel.html
+sounds/
+findings.md
+progress.md
+task_plan.md
+
+# Local OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

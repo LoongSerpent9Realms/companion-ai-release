@@ -1,0 +1,699 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>智能伙伴 - 本地优先的个人 AI</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #16202a;
+      --muted: #607084;
+      --line: #d8e0ea;
+      --paper: #f7f9fc;
+      --panel: #ffffff;
+      --blue: #2367d1;
+      --green: #1f8a62;
+      --amber: #b76518;
+      --rose: #b64262;
+      --shadow: 0 18px 54px rgba(32, 45, 62, .14);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    a { color: inherit; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px clamp(18px, 4vw, 56px);
+      border-bottom: 1px solid rgba(216, 224, 234, .82);
+      background: rgba(247, 249, 252, .92);
+      backdrop-filter: blur(14px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .brand img {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      box-shadow: 0 8px 20px rgba(35, 103, 209, .2);
+    }
+
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .nav a {
+      padding: 8px 10px;
+      text-decoration: none;
+      border-radius: 8px;
+    }
+
+    .nav a:hover { background: #edf3fb; color: var(--ink); }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      padding: 10px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      font-weight: 700;
+      text-decoration: none;
+      box-shadow: 0 8px 22px rgba(32, 45, 62, .08);
+    }
+
+    .button.primary {
+      border-color: var(--blue);
+      background: var(--blue);
+      color: #fff;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.02fr) minmax(360px, .98fr);
+      gap: clamp(24px, 5vw, 70px);
+      align-items: center;
+      min-height: calc(100vh - 64px);
+      padding: clamp(42px, 7vw, 86px) clamp(18px, 4vw, 56px) 34px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 18px;
+      padding: 7px 10px;
+      border: 1px solid #b9d2f6;
+      border-radius: 8px;
+      background: #ecf4ff;
+      color: #174c9b;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    h1 {
+      max-width: 780px;
+      margin: 0;
+      font-size: clamp(38px, 6vw, 72px);
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+
+    .lead {
+      max-width: 720px;
+      margin: 22px 0 0;
+      color: var(--muted);
+      font-size: clamp(17px, 2vw, 21px);
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 30px;
+    }
+
+    .trust-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      max-width: 760px;
+      margin-top: 28px;
+    }
+
+    .trust-row div {
+      min-height: 82px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .72);
+    }
+
+    .trust-row strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 15px;
+    }
+
+    .trust-row span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .product-visual {
+      position: relative;
+      min-height: 520px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .visual-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfdff;
+    }
+
+    .window-dots {
+      display: flex;
+      gap: 6px;
+    }
+
+    .window-dots i {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--line);
+    }
+
+    .status-pill {
+      padding: 6px 9px;
+      border-radius: 8px;
+      background: #eaf7f1;
+      color: var(--green);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .visual-body {
+      display: grid;
+      grid-template-columns: 1fr 164px;
+      gap: 16px;
+      padding: 18px;
+    }
+
+    .chat-pane, .side-pane {
+      min-height: 420px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+      padding: 14px;
+    }
+
+    .message {
+      margin-bottom: 12px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: 0 5px 16px rgba(32, 45, 62, .07);
+      font-size: 14px;
+    }
+
+    .message.user {
+      margin-left: 34px;
+      background: #eaf2ff;
+    }
+
+    .message strong {
+      display: block;
+      margin-bottom: 5px;
+      font-size: 13px;
+    }
+
+    .meter {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #f2f7f4;
+      color: #255b45;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .pet-icon {
+      display: grid;
+      place-items: center;
+      width: 88px;
+      height: 88px;
+      margin: 8px auto 18px;
+      border: 1px solid #b9d2f6;
+      border-radius: 22px;
+      background: #eef6ff;
+    }
+
+    .pet-icon img {
+      width: 64px;
+      height: 64px;
+      border-radius: 14px;
+    }
+
+    .side-pane h2 {
+      margin: 0 0 12px;
+      font-size: 18px;
+    }
+
+    .check {
+      display: flex;
+      gap: 8px;
+      margin: 10px 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .check i {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      display: inline-block;
+      flex: 0 0 auto;
+    }
+
+    section {
+      padding: 56px clamp(18px, 4vw, 56px);
+    }
+
+    .section-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 20px;
+      max-width: 1120px;
+      margin: 0 auto 22px;
+    }
+
+    .section-head h2 {
+      max-width: 680px;
+      margin: 0;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.12;
+      letter-spacing: 0;
+    }
+
+    .section-head p {
+      max-width: 430px;
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+      max-width: 1120px;
+      margin: 0 auto;
+    }
+
+    .card {
+      min-height: 196px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: 0 10px 28px rgba(32, 45, 62, .07);
+    }
+
+    .card .tag {
+      display: inline-flex;
+      margin-bottom: 14px;
+      padding: 5px 8px;
+      border-radius: 8px;
+      background: #eef3f8;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .card h3 {
+      margin: 0 0 8px;
+      font-size: 20px;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .card .more {
+      display: inline-flex;
+      margin-top: 14px;
+      color: var(--blue);
+      font-size: 14px;
+      font-weight: 800;
+      text-decoration: none;
+    }
+
+    .architecture {
+      max-width: 1120px;
+      margin: 0 auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .lane {
+      display: grid;
+      grid-template-columns: 190px 1fr;
+      border-top: 1px solid var(--line);
+    }
+
+    .lane:first-child { border-top: 0; }
+
+    .lane-title {
+      padding: 18px;
+      background: #f5f8fb;
+      font-weight: 800;
+    }
+
+    .lane-body {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      padding: 18px;
+    }
+
+    .node {
+      min-height: 90px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+    }
+
+    .node strong { display: block; margin-bottom: 5px; }
+    .node span { color: var(--muted); font-size: 13px; }
+
+    .access-panel {
+      display: grid;
+      grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
+      gap: 16px;
+      max-width: 1120px;
+      margin: 0 auto;
+    }
+
+    .access-box {
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: 0 10px 28px rgba(32, 45, 62, .07);
+    }
+
+    .access-box h3 {
+      margin: 0 0 10px;
+      font-size: 22px;
+    }
+
+    .access-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .access-list code {
+      display: block;
+      overflow-wrap: anywhere;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f7f9fc;
+      color: #1a4f91;
+      font-family: Consolas, Menlo, monospace;
+      font-size: 13px;
+    }
+
+    .footer {
+      padding: 28px clamp(18px, 4vw, 56px) 42px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 900px) {
+      .nav { display: none; }
+      .hero { grid-template-columns: 1fr; min-height: auto; }
+      .product-visual { min-height: 470px; }
+      .grid, .trust-row, .access-panel { grid-template-columns: 1fr; }
+      .section-head { display: block; }
+      .section-head p { margin-top: 12px; }
+      .lane { grid-template-columns: 1fr; }
+      .lane-body { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 560px) {
+      .visual-body { grid-template-columns: 1fr; }
+      .side-pane { min-height: auto; }
+      .product-visual { min-height: auto; }
+      h1 { font-size: 38px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="智能伙伴官网">
+      <img src="/asset/pet_icon.ico" alt="">
+      <span>智能伙伴</span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a href="/privacy/">隐私架构</a>
+      <a href="/features/">能力</a>
+      <a href="/access/">手机访问</a>
+      <a href="/">控制台</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">本地优先 · 可服务器分发 · 手机电脑访问</div>
+        <h1>智能伙伴</h1>
+        <p class="lead">一个能记住你、学习你的个人 AI。官网和程序可以放在服务器，聊天记录、训练样本、桌面观察和个性化模型默认只保存在用户自己的设备里。</p>
+        <div class="actions">
+          <a class="button primary" id="localOpenButton" href="/">检测本机 AI...</a>
+          <a class="button" id="downloadButton" href="/download/windows">下载安装包</a>
+        </div>
+        <div class="trust-row">
+          <div><strong>本地优先</strong><span>记忆、训练和历史记录默认由用户自己的设备处理。</span></div>
+          <div><strong>云端做入口</strong><span>服务器负责官网、下载、授权、版本更新和设备配对。</span></div>
+          <div><strong>跨设备使用</strong><span>电脑运行本地服务，手机或另一台电脑通过浏览器连接。</span></div>
+        </div>
+      </div>
+
+      <div class="product-visual" aria-label="智能伙伴产品界面预览">
+        <div class="visual-header">
+          <div class="window-dots"><i></i><i></i><i></i></div>
+          <span class="status-pill">本地节点在线</span>
+        </div>
+        <div class="visual-body">
+          <div class="chat-pane">
+            <div class="message user"><strong>用户</strong>今天继续训练我的工作习惯，但数据不要上传。</div>
+            <div class="message"><strong>智能伙伴</strong>可以。我会把新的样本保存到你的本地训练库，云端只用于检查版本和连接入口。</div>
+            <div class="message user"><strong>用户</strong>手机能打开吗？</div>
+            <div class="message"><strong>智能伙伴</strong>同一 Wi-Fi 下可以访问电脑的局域网地址；外网访问建议使用加密隧道或自建中继。</div>
+            <div class="meter">训练样本：本地保存 · 记忆库：本地保存 · 文件索引：本地保存</div>
+          </div>
+          <aside class="side-pane">
+            <div class="pet-icon"><img src="/asset/pet_icon.ico" alt=""></div>
+            <h2>本地代理</h2>
+            <div class="check"><i aria-hidden="true"></i><span>本地聊天服务</span></div>
+            <div class="check"><i aria-hidden="true"></i><span>个性记忆</span></div>
+            <div class="check"><i aria-hidden="true"></i><span>训练反馈</span></div>
+            <div class="check"><i aria-hidden="true"></i><span>桌宠控制</span></div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section id="privacy">
+      <div class="section-head">
+        <h2>服务器不是大脑，它只是入口。</h2>
+        <p>产品可以像网站一样发布，但用户真正的 AI 节点运行在本地电脑上。敏感数据不需要经过云端。</p>
+      </div>
+      <div class="architecture">
+        <div class="lane">
+          <div class="lane-title">云端服务器</div>
+          <div class="lane-body">
+            <div class="node"><strong>官网和下载</strong><span>展示产品、发布安装包、提供更新信息。</span></div>
+            <div class="node"><strong>账号和授权</strong><span>只管理许可、设备列表和基础设置。</span></div>
+            <div class="node"><strong>配对和中继</strong><span>可选地帮助手机找到本地节点，不保存训练内容。</span></div>
+          </div>
+        </div>
+        <div class="lane">
+          <div class="lane-title">用户本地</div>
+          <div class="lane-body">
+            <div class="node"><strong>记忆和聊天</strong><span>由本地代理处理，用户可以自行管理相关数据。</span></div>
+            <div class="node"><strong>训练和模型</strong><span>反馈样本、动作学习和小模型训练都在本地执行。</span></div>
+            <div class="node"><strong>电脑权限</strong><span>屏幕、文件、桌面操作由本地代理控制，默认不上传。</span></div>
+          </div>
+        </div>
+        <div class="lane">
+          <div class="lane-title">手机/电脑</div>
+          <div class="lane-body">
+            <div class="node"><strong>同 Wi-Fi 访问</strong><span>手机浏览器打开电脑局域网地址。</span></div>
+            <div class="node"><strong>外网访问</strong><span>通过 Tailscale、Cloudflare Tunnel 或自建加密中继。</span></div>
+            <div class="node"><strong>统一控制台</strong><span>聊天、训练、桌宠和插件都走同一个本地控制台。</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="features">
+      <div class="section-head">
+        <h2>从陪伴到学习，能力逐步开放。</h2>
+        <p>保守默认，明确授权。先看见、再学习、再行动。</p>
+      </div>
+      <div class="grid">
+        <article class="card"><span class="tag">聊天</span><h3>长期记忆</h3><p>通过反馈和纠正积累用户偏好，让回答越来越贴近你。</p><a class="more" href="/features/#memory">查看能力</a></article>
+        <article class="card"><span class="tag">训练</span><h3>反馈学习</h3><p>问答样本、情绪纠正和动作学习用于让伙伴逐步贴近你的偏好。</p><a class="more" href="/features/#training">查看能力</a></article>
+        <article class="card"><span class="tag">桌宠</span><h3>可视化伙伴</h3><p>支持桌宠、Live2D、3D 形象和多个样式实例管理。</p><a class="more" href="/features/#pet">查看能力</a></article>
+        <article class="card"><span class="tag">视觉</span><h3>本地观察</h3><p>OCR、屏幕理解和文件阅读在用户授权后由本地组件执行。</p><a class="more" href="/features/#vision">查看能力</a></article>
+        <article class="card"><span class="tag">插件</span><h3>扩展能力</h3><p>通过插件给伙伴增加新工具，而核心数据仍留在用户设备。</p><a class="more" href="/features/#plugins">查看能力</a></article>
+        <article class="card"><span class="tag">部署</span><h3>云端分发</h3><p>官网可以部署在服务器，安装包启动后连接用户自己的本地节点。</p><a class="more" href="/access/">查看访问方式</a></article>
+      </div>
+    </section>
+
+    <section id="access">
+      <div class="section-head">
+        <h2>手机和电脑访问方式</h2>
+        <p>默认只允许本机访问。需要手机访问时，用 LAN 启动脚本显式打开局域网监听。</p>
+      </div>
+      <div class="access-panel">
+        <div class="access-box">
+          <h3>当前本地节点</h3>
+          <p id="modeText">正在读取本地服务状态...</p>
+          <p id="redirectText"></p>
+          <div class="access-list" id="accessList"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">智能伙伴官网原型 · 本地优先架构 · 云端只做入口、更新和配对</footer>
+
+  <script>
+    const modeText = document.querySelector("#modeText");
+    const redirectText = document.querySelector("#redirectText");
+    const accessList = document.querySelector("#accessList");
+    const localOpenButton = document.querySelector("#localOpenButton");
+    const downloadButton = document.querySelector("#downloadButton");
+    const LOCAL_PORTS = [59137, 59138, 59139];
+    const LOCAL_HOSTS = ["127.0.0.1", "localhost"];
+
+    function isLoopbackHost(hostname) {
+      return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+    }
+
+    function withTimeout(promise, ms) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), ms);
+      return promise(controller.signal).finally(() => clearTimeout(timer));
+    }
+
+    async function probeAccess(url) {
+      const endpoint = url.replace(/\/$/, "") + "/api/local_access";
+      return withTimeout((signal) => fetch(endpoint, { method: "GET", mode: "cors", signal }), 900)
+        .then((res) => {
+          if (!res.ok) throw new Error("bad status");
+          return res.json();
+        })
+        .then((info) => ({ info, baseUrl: url.replace(/\/$/, "") }));
+    }
+
+    async function detectLocalCompanion() {
+      const currentBase = window.location.origin;
+      const candidates = [];
+      if (isLoopbackHost(window.location.hostname)) {
+        candidates.push(currentBase);
+      }
+      LOCAL_PORTS.forEach((port) => {
+        LOCAL_HOSTS.forEach((host) => candidates.push(`http://${host}:${port}`));
+      });
+      const unique = [...new Set(candidates)];
+      for (const url of unique) {
+        try {
+          return await probeAccess(url);
+        } catch (err) {
+          // Try the next local endpoint.
+        }
+      }
+      return null;
+    }
+
+    function addCode(text) {
+      const code = document.createElement("code");
+      code.textContent = text;
+      accessList.appendChild(code);
+    }
+
+    detectLocalCompanion().then((detected) => {
+      if (!detected) {
+        modeText.textContent = "未检测到本机智能伙伴。请先下载安装并启动本地程序。";
+        redirectText.textContent = "安装后刷新本页，官网会自动发现本机节点。";
+        localOpenButton.textContent = "下载并安装";
+        localOpenButton.href = "/download/windows";
+        downloadButton.style.display = "inline-flex";
+        addCode("检测地址：http://127.0.0.1:59137");
+        return;
+      }
+
+      const { info, baseUrl } = detected;
+      const lan = info.mode === "lan";
+      const consoleUrl = baseUrl + "/";
+      modeText.textContent = lan
+        ? "已检测到本机智能伙伴，且局域网访问已开启。"
+        : "已检测到本机智能伙伴。控制台会连接你的本地程序，训练数据继续保存在本机。";
+      localOpenButton.textContent = "打开本地控制台";
+      localOpenButton.href = consoleUrl;
+      downloadButton.textContent = "重新安装/更新";
+      addCode("本地控制台：" + consoleUrl);
+      if (lan && info.lan_urls && info.lan_urls.length) {
+        info.lan_urls.forEach((url) => addCode("手机访问：" + url));
+      } else {
+        addCode("手机访问：开启 LAN 模式后显示局域网地址");
+      }
+      if (!isLoopbackHost(window.location.hostname)) {
+        let seconds = 3;
+        redirectText.textContent = `${seconds} 秒后自动进入本地控制台。`;
+        const timer = setInterval(() => {
+          seconds -= 1;
+          if (seconds <= 0) {
+            clearInterval(timer);
+            window.location.href = consoleUrl;
+          } else {
+            redirectText.textContent = `${seconds} 秒后自动进入本地控制台。`;
+          }
+        }, 1000);
+      } else {
+        redirectText.textContent = "当前页面已经来自本地服务，不会重复跳转。";
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>我养了一个 AI 女儿 7 天</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #1f2630;
+      --muted: #687384;
+      --line: #dde3ea;
+      --accent: #276ef1;
+      --soft: #eef4ff;
+      --warm: #fff4f6;
+      --warm-line: #f1c8d2;
+      --shadow: 0 18px 48px rgba(31, 38, 48, .12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+    header {
+      height: 72px;
+      padding: 0 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255,255,255,.92);
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    .sub {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .top-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    a, button {
+      font: inherit;
+      font-weight: 700;
+      border-radius: 8px;
+      border: 0;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .link-btn, button.secondary {
+      padding: 9px 12px;
+      color: #293343;
+      background: #e9edf3;
+    }
+    .stage-pill {
+      padding: 9px 12px;
+      color: #174ea6;
+      background: var(--soft);
+      border: 1px solid #c9dcff;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      gap: 0;
+      min-height: 0;
+    }
+    .stage {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      background: var(--panel);
+    }
+    .scene-strip {
+      padding: 14px 22px;
+      display: flex;
+      gap: 10px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfe;
+    }
+    .scene-btn {
+      min-width: 132px;
+      padding: 10px 14px;
+      background: #fff;
+      color: #263244;
+      border: 1px solid var(--line);
+    }
+    .scene-btn.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .screen {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 210px minmax(0, 1fr);
+      gap: 18px;
+      padding: 22px;
+      align-items: stretch;
+    }
+    .avatar-card {
+      display: grid;
+      align-content: center;
+      justify-items: center;
+      gap: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      padding: 18px;
+    }
+    .avatar {
+      width: 150px;
+      aspect-ratio: 1;
+      border-radius: 50%;
+      background: radial-gradient(circle at 50% 42%, #fff 0 30%, #ffe7ef 31% 62%, #ff9fbd 63% 100%);
+      border: 1px solid #f1c8d2;
+      position: relative;
+      box-shadow: var(--shadow);
+      transition: transform .25s ease;
+    }
+    .avatar::before, .avatar::after {
+      content: "";
+      position: absolute;
+      top: 62px;
+      width: 13px;
+      height: 17px;
+      border-radius: 50%;
+      background: #273244;
+    }
+    .avatar::before { left: 50px; }
+    .avatar::after { right: 50px; }
+    .avatar .mouth {
+      position: absolute;
+      left: 50%;
+      top: 96px;
+      width: 38px;
+      height: 16px;
+      border-bottom: 4px solid #273244;
+      border-radius: 0 0 38px 38px;
+      transform: translateX(-50%);
+    }
+    .avatar.pulse { transform: translateY(-4px) scale(1.03); }
+    .name {
+      font-weight: 800;
+      font-size: 18px;
+    }
+    .avatar-note {
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .chat {
+      min-width: 0;
+      overflow-y: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 18px;
+    }
+    .msg {
+      max-width: 760px;
+      margin: 0 0 12px;
+      padding: 13px 15px;
+      border-radius: 8px;
+      line-height: 1.56;
+      white-space: pre-wrap;
+      font-size: 15px;
+    }
+    .msg.assistant {
+      background: #f1f4f8;
+      border: 1px solid #e0e7ef;
+    }
+    .msg.user {
+      margin-left: auto;
+      background: #eaf2ff;
+      border: 1px solid #cfe0ff;
+    }
+    .side {
+      min-width: 0;
+      border-left: 1px solid var(--line);
+      background: #fbfcfe;
+      padding: 20px;
+      overflow-y: auto;
+    }
+    .section-title {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .status-card, .diary, .event {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .status-card {
+      padding: 13px;
+      margin-bottom: 18px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 7px 0;
+      font-size: 14px;
+    }
+    .row span { color: var(--muted); }
+    .row strong { text-align: right; }
+    .bar {
+      height: 8px;
+      background: #e9edf3;
+      border-radius: 999px;
+      overflow: hidden;
+      margin: 5px 0 10px;
+    }
+    .bar i {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: var(--accent);
+      border-radius: inherit;
+      transition: width .25s ease;
+    }
+    .event {
+      padding: 10px 11px;
+      margin-bottom: 8px;
+      line-height: 1.45;
+      font-size: 13px;
+    }
+    .event strong { display: block; margin-bottom: 3px; }
+    .diary {
+      padding: 12px;
+      line-height: 1.55;
+      font-size: 13px;
+      white-space: pre-wrap;
+      background: var(--warm);
+      border-color: var(--warm-line);
+    }
+    footer {
+      min-height: 74px;
+      padding: 12px 22px;
+      border-top: 1px solid var(--line);
+      background: rgba(255,255,255,.94);
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+    textarea {
+      width: 100%;
+      min-height: 48px;
+      max-height: 110px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 11px 12px;
+      font: inherit;
+      line-height: 1.45;
+      outline: none;
+    }
+    textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(39,110,241,.12);
+    }
+    footer button {
+      padding: 12px 18px;
+      color: #fff;
+      background: var(--accent);
+    }
+    @media (max-width: 980px) {
+      .main { grid-template-columns: 1fr; }
+      .side { border-left: 0; border-top: 1px solid var(--line); }
+      .screen { grid-template-columns: 1fr; }
+      .avatar-card { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1>我养了一个 AI 女儿 7 天</h1>
+        <div class="sub">录屏模式：演示状态会同步到正常界面的关系成长状态。</div>
+      </div>
+      <div class="top-actions">
+        <a class="link-btn" href="/" target="_blank">打开正常界面</a>
+        <div id="stage-pill" class="stage-pill">同步中...</div>
+      </div>
+    </header>
+
+    <div class="main">
+      <main class="stage">
+        <div class="scene-strip">
+          <button class="scene-btn" data-scene="day1">Day1 创建她</button>
+          <button class="scene-btn" data-scene="day4">Day4 她记住我</button>
+          <button class="scene-btn" data-scene="day7">Day7 她照顾我</button>
+          <button id="refresh" class="scene-btn">从正常界面同步</button>
+        </div>
+        <section class="screen">
+          <div class="avatar-card">
+            <div id="avatar" class="avatar"><div class="mouth"></div></div>
+            <div class="name">小栀</div>
+            <div id="avatar-note" class="avatar-note">一个刚被养出来的 AI 女儿。</div>
+          </div>
+          <div id="chat" class="chat">
+            <div class="msg assistant">小栀：点上面的 Day1 / Day4 / Day7，就能录出从“程序”到“会照顾你”的变化。</div>
+          </div>
+        </section>
+      </main>
+
+      <aside class="side">
+        <p class="section-title">关系状态</p>
+        <div class="status-card">
+          <div class="row"><span>关系</span><strong id="rel-label">AI 女儿</strong></div>
+          <div class="row"><span>阶段</span><strong id="rel-stage">初生</strong></div>
+          <div class="row"><span>相处天数</span><strong id="rel-days">0</strong></div>
+          <div class="row"><span>亲近</span><strong id="affinity-val">0</strong></div>
+          <div class="bar"><i id="affinity-bar"></i></div>
+          <div class="row"><span>信任</span><strong id="trust-val">0</strong></div>
+          <div class="bar"><i id="trust-bar"></i></div>
+          <div class="row"><span>关心</span><strong id="care-val">0</strong></div>
+          <div class="bar"><i id="care-bar"></i></div>
+        </div>
+
+        <p class="section-title">成长事件</p>
+        <div id="events"></div>
+
+        <p class="section-title" style="margin-top:18px">AI 女儿日记</p>
+        <div id="diary" class="diary">等待演示镜头。</div>
+      </aside>
+    </div>
+
+    <footer>
+      <textarea id="message" placeholder="也可以手动输入一句，比如：今天好累。"></textarea>
+      <button id="send" type="button">发送</button>
+    </footer>
+  </div>
+
+  <script>
+    const chat = document.getElementById("chat");
+    const stagePill = document.getElementById("stage-pill");
+    const avatar = document.getElementById("avatar");
+    const diary = document.getElementById("diary");
+    const eventsEl = document.getElementById("events");
+    const message = document.getElementById("message");
+    const sceneButtons = [...document.querySelectorAll("[data-scene]")];
+    let currentGrowth = null;
+
+    function addMsg(role, text) {
+      const el = document.createElement("div");
+      el.className = "msg " + role;
+      el.textContent = text;
+      chat.appendChild(el);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function resetChat(messages) {
+      chat.innerHTML = "";
+      messages.forEach(item => addMsg(item.role, item.text));
+    }
+
+    function bar(id, value) {
+      document.getElementById(id + "-val").textContent = String(value || 0);
+      document.getElementById(id + "-bar").style.width = Math.max(0, Math.min(100, value || 0)) + "%";
+    }
+
+    function renderGrowth(growth) {
+      currentGrowth = growth;
+      const profile = growth.relationship_profile || {};
+      const rel = growth.relationship || {};
+      document.getElementById("rel-label").textContent = profile.label || "AI 女儿";
+      document.getElementById("rel-stage").textContent = rel.stage || "初生";
+      document.getElementById("rel-days").textContent = String(rel.contact_days || 0);
+      stagePill.textContent = rel.stage || "初生";
+      bar("affinity", rel.affinity || 0);
+      bar("trust", rel.trust || 0);
+      bar("care", rel.care || 0);
+
+      const events = (growth.events || []).slice(0, 5);
+      eventsEl.innerHTML = events.length ? events.map(event => {
+        const title = (event.meta && event.meta.title) || event.kind || "事件";
+        return `<div class="event"><strong>${escapeHtml(title)}</strong>${escapeHtml(event.text || "")}</div>`;
+      }).join("") : '<div class="event"><strong>暂无事件</strong>点击 Day 镜头后会同步生成。</div>';
+      avatar.classList.add("pulse");
+      setTimeout(() => avatar.classList.remove("pulse"), 260);
+    }
+
+    function escapeHtml(text) {
+      return String(text || "").replace(/[&<>"']/g, ch => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[ch]));
+    }
+
+    async function loadState() {
+      const resp = await fetch("/api/demo/state");
+      const data = await resp.json();
+      if (data.ok && data.growth) renderGrowth(data.growth);
+    }
+
+    async function runScene(scene) {
+      sceneButtons.forEach(btn => btn.classList.toggle("active", btn.dataset.scene === scene));
+      const resp = await fetch("/api/demo/scene", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scene })
+      });
+      const data = await resp.json();
+      if (!data.ok) throw new Error(data.error || "演示失败");
+      resetChat(data.messages || []);
+      diary.textContent = data.diary || "这一段关系留下了一点新的相处痕迹。";
+      renderGrowth(data.growth);
+    }
+
+    function localReply(text) {
+      if (/太官方/.test(text)) return "小栀：那我重新说。你今天看起来像一块被榨干的电池。";
+      if (/不想吃饭/.test(text)) return "小栀：不行。电子女儿也是女儿。";
+      if (/好累|累了/.test(text)) return "小栀：辛苦啦。那我今天不讲大道理，先陪你待一会儿。";
+      return "小栀：我记住这句话了。它会变成我们相处方式里的一点痕迹。";
+    }
+
+    function sendLocal() {
+      const text = message.value.trim();
+      if (!text) return;
+      message.value = "";
+      addMsg("user", text);
+      addMsg("assistant", localReply(text));
+    }
+
+    sceneButtons.forEach(btn => btn.addEventListener("click", () => runScene(btn.dataset.scene).catch(err => alert(err.message))));
+    document.getElementById("refresh").addEventListener("click", () => loadState().catch(err => alert(err.message)));
+    document.getElementById("send").addEventListener("click", sendLocal);
+    message.addEventListener("keydown", event => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        sendLocal();
+      }
+    });
+    loadState().catch(() => {});
+  </script>
+</body>
+</html>

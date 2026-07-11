@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>隐私架构 - 智能伙伴</title>
+  <link rel="stylesheet" href="/asset/detail.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="智能伙伴官网">
+      <img src="/asset/pet_icon.ico" alt="">
+      <span>智能伙伴</span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a class="active" href="/privacy/">隐私架构</a>
+      <a href="/features/">能力</a>
+      <a href="/access/">手机访问</a>
+      <a href="/">控制台</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="detail-hero">
+      <div>
+        <span class="eyebrow">本地优先架构</span>
+        <h1>服务器做入口，本地设备才是个人 AI 的大脑。</h1>
+        <p class="lead">官网、下载、授权和更新可以放在云端；聊天记录、训练样本、记忆库、桌面观察和个性化模型默认留在用户自己的电脑。</p>
+        <div class="button-row">
+          <a class="button primary" href="/features/">查看能力边界</a>
+          <a class="button" href="/access/">查看访问方式</a>
+        </div>
+      </div>
+      <aside class="hero-panel">
+        <div class="mini-stat"><strong>云端</strong><span>官网、安装包、授权、版本更新</span></div>
+        <div class="mini-stat"><strong>本地</strong><span>记忆、聊天、训练、屏幕和文件权限</span></div>
+        <div class="mini-stat"><strong>移动端</strong><span>通过浏览器连接用户自己的本地节点</span></div>
+      </aside>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>三层边界</h2>
+        <p>拆成二级页后，隐私架构可以独立解释清楚，不再挤在首页一张结构图里。</p>
+      </div>
+      <div class="grid">
+        <article class="card"><span class="tag">云端服务器</span><h3>只做公共入口</h3><p>承载官网、下载页面、版本信息、基础授权和可选配对服务，不保存用户训练内容。</p></article>
+        <article class="card"><span class="tag">用户本地</span><h3>保存敏感数据</h3><p>历史对话、记忆、训练样本、文件索引和桌面权限都在本机服务中处理。</p></article>
+        <article class="card"><span class="tag">手机/电脑</span><h3>作为访问终端</h3><p>手机浏览器访问电脑节点，本质上是在远程操作自己的本地 AI，而不是把数据交给官网。</p></article>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>数据流向</h2>
+        <p>用户需要知道哪些信息会离开设备，哪些信息默认不会离开设备。</p>
+      </div>
+      <div class="wide-panel">
+        <div class="step"><strong>默认留本地</strong><div><p>聊天记录、训练样本、记忆库、桌面观察结果、文件索引和个人模型配置。</p></div></div>
+        <div class="step"><strong>可与云端交互</strong><div><p>安装包下载、版本检查、授权状态、设备配对和用户主动启用的外部模型请求。</p></div></div>
+        <div class="step"><strong>需要明确授权</strong><div><p>屏幕读取、文件读取、桌面操作、局域网监听、外网隧道和插件访问外部服务。</p></div></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">智能伙伴 · 隐私架构</footer>
+</body>
+</html>
