@@ -95,11 +95,67 @@ jobs:
           path: dist/windows/*
           if-no-files-found: error
 
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            architecture: x86_64
+          - runner: macos-14
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version="$(tr -d '[:space:]' < version.txt)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$version" = "$tag_version" || {
+            echo "Tag version $tag_version does not match version.txt $version" >&2
+            exit 1
+          }
+
+      - name: Build macOS disk image
+        shell: bash
+        run: |
+          chmod +x build_macos.sh
+          ./build_macos.sh
+
+      - name: Verify architecture and prepare asset
+        shell: bash
+        run: |
+          version="$(tr -d '[:space:]' < version.txt)"
+          expected="dist/macos/companion-ai-${version}-macos-${{ matrix.architecture }}.dmg"
+          test -f "$expected" || {
+            echo "Missing expected macOS asset: $expected" >&2
+            find dist/macos -maxdepth 1 -type f -print
+            exit 1
+          }
+          shasum -a 256 "$expected"
+
+      - name: Upload macOS disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: companion-ai-macos-${{ matrix.architecture }}
+          path: dist/macos/*.dmg
+          if-no-files-found: error
+
   create-release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - build-linux
       - build-windows
+      - build-macos
     runs-on: ubuntu-22.04
     steps:
       - name: Download Linux packages
@@ -113,6 +169,13 @@ jobs:
         with:
           name: companion-ai-windows
           path: release-assets
+
+      - name: Download macOS disk images
+        uses: actions/download-artifact@v4
+        with:
+          pattern: companion-ai-macos-*
+          path: release-assets
+          merge-multiple: true
 
       - name: Create GitHub Release
         env:

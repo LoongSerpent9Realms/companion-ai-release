@@ -5,7 +5,7 @@
 项目发布仓库：[LoongSerpent9Realms/companion-ai-release](https://github.com/LoongSerpent9Realms/companion-ai-release)
 
 > 当前版本：`1.0.42`
-> 当前提供 Windows 安装包和 Linux `.deb`/`.tar.gz` 包。项目仍在持续开发中，使用前请阅读下方的隐私说明和能力边界。
+> 当前提供 Windows 安装包、Linux `.deb`/`.tar.gz` 包和 macOS `.dmg` 包。项目仍在持续开发中，使用前请阅读下方的隐私说明和能力边界。
 
 ## 功能概览
 
@@ -36,7 +36,7 @@
 
 ### 方式二：使用 Linux 安装包
 
-从 [Releases](https://github.com/LoongSerpent9Realms/companion-ai-release/releases) 下载 Linux `.deb`/`.tar.gz` 或 Windows 安装包。每次推送匹配 `version.txt` 的 `v*` 标签后，GitHub Actions 会自动构建 Linux 和 Windows 包，并创建新的 Release。
+从 [Releases](https://github.com/LoongSerpent9Realms/companion-ai-release/releases) 下载 Linux `.deb`/`.tar.gz` 或 Windows 安装包。每次推送匹配 `version.txt` 的 `v*` 标签后，GitHub Actions 会自动构建 Linux、Windows 和 macOS 包，并创建新的 Release。
 
 Debian/Ubuntu：
 
@@ -79,6 +79,15 @@ python app.py
 ```powershell
 python companion_launcher.py --pet
 ```
+
+### 方式四：使用 macOS 安装包
+
+从 [Releases](https://github.com/LoongSerpent9Realms/companion-ai-release/releases) 下载对应架构的 `.dmg` 文件，将 `CompanionAI.app` 拖入“应用程序”文件夹后启动。当前自动提供：
+
+- `x86_64`：Intel Mac
+- `arm64`：Apple Silicon Mac（M1/M2/M3/M4）
+
+macOS 用户数据默认保存在 `~/.local/share/CompanionAI`；设置 `XDG_DATA_HOME` 后会改用该目录。
 
 ## 第一次使用
 
@@ -165,6 +174,7 @@ Companion AI 当前不是通用大语言模型。它主要通过本地规则、�
 | `build_exe.py` | 构建 PyInstaller 应用 |
 | `build_release.ps1` | 构建并签名 Windows 安装包 |
 | `build_linux.sh` | 构建 Linux `.deb` 和 `.tar.gz` 包 |
+| `build_macos.sh` | 构建 macOS `.app` 和 `.dmg` 包 |
 
 ## 开发与构建
 
@@ -204,6 +214,20 @@ chmod +x build_linux.sh packaging/linux/*.sh packaging/linux/companion-ai
 ```text
 companion-ai-<version>-linux-<arch>.deb
 companion-ai-<version>-linux-<arch>.tar.gz
+```
+
+构建 macOS 包需要在 macOS 上运行，并需要 Python 3、Xcode Command Line Tools 和网络连接：
+
+```bash
+chmod +x build_macos.sh
+./build_macos.sh
+```
+
+输出文件位于 `dist/macos/`：
+
+```text
+companion-ai-<version>-macos-x86_64.dmg
+companion-ai-<version>-macos-arm64.dmg
 ```
 
 ### 自动发布
