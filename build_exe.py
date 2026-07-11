@@ -11,6 +11,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # 版本号文件（集中管理，build_exe.py 与 companion_ai_setup.nsi 同步读取）
 VERSION_FILE = ROOT / "version.txt"
 NSI_FILE = ROOT / "companion_ai_setup.nsi"
