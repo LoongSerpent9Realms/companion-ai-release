@@ -4,8 +4,8 @@
 
 项目发布仓库：[LoongSerpent9Realms/companion-ai-release](https://github.com/LoongSerpent9Realms/companion-ai-release)
 
-> 当前版本：`1.0.42`  
-> 主要面向 Windows 用户。项目仍在持续开发中，使用前请阅读下方的隐私说明和能力边界。
+> 当前版本：`1.0.42`
+> 当前提供 Windows 安装包和 Linux `.deb`/`.tar.gz` 包。项目仍在持续开发中，使用前请阅读下方的隐私说明和能力边界。
 
 ## 功能概览
 
@@ -34,7 +34,29 @@
 
 默认数据保存在应用数据目录中，不会写入 GitHub 仓库。
 
-### 方式二：从源码运行
+### 方式二：使用 Linux 安装包
+
+从 [Actions](https://github.com/LoongSerpent9Realms/companion-ai-release/actions) 的 `Linux package` 工作流下载构件，或从 [Releases](https://github.com/LoongSerpent9Realms/companion-ai-release/releases) 下载发布包。
+
+Debian/Ubuntu：
+
+```bash
+sudo dpkg -i companion-ai-*-linux-*.deb
+companion-ai
+```
+
+通用 Linux 压缩包：
+
+```bash
+tar -xzf companion-ai-*-linux-*.tar.gz
+cd companion-ai-*-linux-*
+./install-user.sh
+companion-ai
+```
+
+Linux 用户数据默认保存在 `~/.local/share/CompanionAI`；设置 `XDG_DATA_HOME` 后会改用该目录。桌面入口使用系统默认浏览器打开本地控制台。
+
+### 方式三：从源码运行
 
 需要 Python 3.10 或更高版本。建议使用虚拟环境：
 
@@ -142,6 +164,7 @@ Companion AI 当前不是通用大语言模型。它主要通过本地规则、�
 | `Install Companion Desktop Pet.cmd` | 启动桌面宠物安装器 |
 | `build_exe.py` | 构建 PyInstaller 应用 |
 | `build_release.ps1` | 构建并签名 Windows 安装包 |
+| `build_linux.sh` | 构建 Linux `.deb` 和 `.tar.gz` 包 |
 
 ## 开发与构建
 
@@ -167,6 +190,20 @@ python -m unittest discover -p "test_*.py"
 
 ```powershell
 .\build_release.ps1 -SkipSigning
+```
+
+构建 Linux 包需要 Linux、Python 3、`python3-tk`、`dpkg-deb` 和网络连接：
+
+```bash
+chmod +x build_linux.sh packaging/linux/*.sh packaging/linux/companion-ai
+./build_linux.sh
+```
+
+输出文件位于 `dist/linux/`：
+
+```text
+companion-ai-<version>-linux-<arch>.deb
+companion-ai-<version>-linux-<arch>.tar.gz
 ```
 
 ## 项目结构

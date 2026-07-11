@@ -50,17 +50,25 @@ def resource_dir(caller_file: str) -> Path:
 def data_dir(root: Path | None = None) -> Path:
     """Return a persistent directory for user data (identity, memory, models).
 
-    Uses ``%APPDATA%/CompanionAI`` on Windows so that data survives code
-    updates which overwrite the project directory.  Falls back to
-    ``<root>/data`` when ``APPDATA`` is not available.
+    Uses ``%APPDATA%/CompanionAI`` on Windows and
+    ``$XDG_DATA_HOME/CompanionAI`` (or ``~/.local/share/CompanionAI``) on
+    Linux. This keeps data outside installed application directories so it
+    survives code updates and works when the app is installed under ``/opt``.
+    Falls back to ``<root>/data`` when no user data directory is available.
 
     On first call the function migrates any existing ``<root>/data`` content
     to the new location.
     """
-    appdata = os.environ.get("APPDATA")
     fallback = (root or Path.cwd()) / "data"
-    if appdata:
-        dest = Path(appdata) / "CompanionAI"
+    if os.name == "nt" and os.environ.get("APPDATA"):
+        dest = Path(os.environ["APPDATA"]) / "CompanionAI"
+    elif os.name == "posix":
+        xdg_data_home = os.environ.get("XDG_DATA_HOME")
+        dest = (
+            Path(xdg_data_home) / "CompanionAI"
+            if xdg_data_home
+            else Path.home() / ".local" / "share" / "CompanionAI"
+        )
     else:
         dest = fallback
 

@@ -1,0 +1,34 @@
+name: Linux package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev python3-tk python3-venv
+
+      - name: Build Linux packages
+        run: |
+          chmod +x build_linux.sh packaging/linux/*.sh packaging/linux/companion-ai
+          ./build_linux.sh
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: companion-ai-linux
+          path: dist/linux/*
+          if-no-files-found: error

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Companion AI
+Comment=Local-first AI companion and desktop pet
+Exec=companion-ai
+Terminal=false
+Categories=Utility;Chat;
+StartupNotify=true

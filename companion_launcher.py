@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -97,6 +98,21 @@ def remove_pid(name: str) -> None:
         pass
 
 
+def _terminate_pid(pid: int) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F", "/T"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def stop_pid_file(name: str) -> None:
     path = pid_file(name)
     try:
@@ -105,12 +121,7 @@ def stop_pid_file(name: str) -> None:
         return
     if pid == os.getpid():
         return
-    subprocess.run(
-        ["taskkill", "/PID", str(pid), "/F", "/T"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    _terminate_pid(pid)
     remove_pid(name)
 
 
@@ -140,12 +151,7 @@ def _register_pet_instance(pid: int) -> None:
 def _stop_registered_pet_instances() -> None:
     pids = _read_pet_instance_pids()
     for pid in pids:
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/F", "/T"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        _terminate_pid(pid)
     try:
         pet_instances_file().unlink(missing_ok=True)
     except Exception:
