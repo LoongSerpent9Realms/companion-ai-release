@@ -85,7 +85,7 @@ jobs:
           $version = (Get-Content version.txt -Raw).Trim()
           $output = "dist\windows"
           New-Item -ItemType Directory -Force -Path $output | Out-Null
-          Copy-Item "installer_output\AI陪伴桌宠-Setup.exe" "$output\CompanionAI-Setup-v$version.exe"
+          Copy-Item "installer_output\CompanionAI-Setup.exe" "$output\CompanionAI-Setup-v$version.exe"
           Get-FileHash "$output\CompanionAI-Setup-v$version.exe" -Algorithm SHA256 | Format-List
 
       - name: Upload Windows installer

@@ -22,7 +22,7 @@ SetCompressor /SOLID lzma
 !include "FileFunc.nsh"
 
 Name "${MyAppName}"
-OutFile "installer_output\AI陪伴桌宠-Setup.exe"
+OutFile "installer_output\CompanionAI-Setup.exe"
 InstallDir "$LOCALAPPDATA\${MyAppDirName}"
 InstallDirRegKey HKCU "Software\${MyAppDirName}" "InstallDir"
 RequestExecutionLevel admin

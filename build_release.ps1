@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AppExe = Join-Path $Root "dist\CompanionAI\CompanionAI.exe"
 $NsiFile = Join-Path $Root "companion_ai_setup.nsi"
-$InstallerExe = Join-Path $Root "installer_output\AI陪伴桌宠-Setup.exe"
+$InstallerExe = Join-Path $Root "installer_output\CompanionAI-Setup.exe"
 
 function Resolve-CommandPath {
     param(

@@ -24,7 +24,7 @@
 
 ### 方式一：使用 Windows 安装包
 
-从 [Releases](https://github.com/LoongSerpent9Realms/companion-ai-release/releases) 下载最新的 `CompanionAI-Setup-*.exe`，按安装向导完成安装。
+从 [Releases](https://github.com/LoongSerpent9Realms/companion-ai-release/releases) 下载最新的 `CompanionAI-Setup-*.exe`，按安装向导完成安装。安装器文件名使用 ASCII，便于在不同系统和镜像服务中下载。
 
 安装后可以从桌面或开始菜单启动：
 
