@@ -1,0 +1,121 @@
+name: Build and release Companion AI
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev python3-tk python3-venv
+
+      - name: Verify tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(tr -d '[:space:]' < version.txt)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$version" = "$tag_version" || {
+            echo "Tag version $tag_version does not match version.txt $version" >&2
+            exit 1
+          }
+
+      - name: Build Linux packages
+        run: |
+          chmod +x build_linux.sh packaging/linux/*.sh packaging/linux/companion-ai
+          ./build_linux.sh
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: companion-ai-linux
+          path: dist/linux/*
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Windows packaging dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller pillow pystray certifi
+          choco install nsis --no-progress --yes
+          $env:Path += ";$env:ChocolateyInstall\bin;C:\Program Files (x86)\NSIS;C:\Program Files\NSIS"
+          "PATH=$env:Path" >> $env:GITHUB_ENV
+
+      - name: Verify tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (Get-Content version.txt -Raw).Trim()
+          $tagVersion = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($version -ne $tagVersion) {
+            throw "Tag version $tagVersion does not match version.txt $version"
+          }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: .\build_release.ps1 -SkipSigning
+
+      - name: Prepare Windows release asset
+        shell: pwsh
+        run: |
+          $version = (Get-Content version.txt -Raw).Trim()
+          $output = "dist\windows"
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          Copy-Item "installer_output\AI陪伴桌宠-Setup.exe" "$output\CompanionAI-Setup-v$version.exe"
+          Get-FileHash "$output\CompanionAI-Setup-v$version.exe" -Algorithm SHA256 | Format-List
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: companion-ai-windows
+          path: dist/windows/*
+          if-no-files-found: error
+
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-linux
+      - build-windows
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download Linux packages
+        uses: actions/download-artifact@v4
+        with:
+          name: companion-ai-linux
+          path: release-assets
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: companion-ai-windows
+          path: release-assets
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Companion AI $GITHUB_REF_NAME" \
+            --generate-notes

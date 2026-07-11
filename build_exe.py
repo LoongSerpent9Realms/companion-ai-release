@@ -80,6 +80,28 @@ def electron_data_args() -> list[str]:
     return args
 
 
+def local_data_args() -> list[str]:
+    """Return data arguments for resources that exist in a clean checkout."""
+    items = [
+        (ROOT / "data", "data"),
+        (ROOT / "plugins", "plugins"),
+        (ROOT / "static", "static"),
+        (ROOT / "live2d_viewer.html", "."),
+        (ROOT / "viewer_3d.html", "."),
+        (ROOT / "official_site.html", "."),
+        (ROOT / "version.txt", "."),
+        (ROOT / "dataset_runtime_worker.py", "."),
+        (ROOT / "face_manager.py", "."),
+        (ROOT / "sensitive_json.py", "."),
+        (ROOT / "secure_json.py", "."),
+    ]
+    args: list[str] = []
+    for source, target in items:
+        if source.exists():
+            args.extend(["--add-data", f"{source};{target}"])
+    return args
+
+
 def face_recognition_model_data_args() -> list[str]:
     """Return PyInstaller data arguments for face_recognition model files."""
     spec = importlib.util.find_spec("face_recognition_models")
@@ -320,28 +342,7 @@ def main() -> None:
         "CompanionAI",
         "--icon",
         str(ROOT / "pet_icon.ico"),
-        "--add-data",
-        f"{ROOT / 'data'};data",
-        "--add-data",
-        f"{ROOT / 'plugins'};plugins",
-        "--add-data",
-        f"{ROOT / 'static'};static", 
-        "--add-data",
-        f"{ROOT / 'live2d_viewer.html'};.",
-        "--add-data",
-        f"{ROOT / 'viewer_3d.html'};.",
-        "--add-data",
-        f"{ROOT / 'official_site.html'};.",
-        "--add-data",
-        f"{ROOT / 'version.txt'};.",
-        "--add-data",
-        f"{ROOT / 'dataset_runtime_worker.py'};.",
-        "--add-data",
-        f"{ROOT / 'face_manager.py'};.",
-        "--add-data",
-        f"{ROOT / 'sensitive_json.py'};.",
-        "--add-data",
-        f"{ROOT / 'secure_json.py'};.",
+        *local_data_args(),
         *electron_data_args(),
         *face_recognition_model_data_args(),
         "--hidden-import",

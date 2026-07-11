@@ -36,7 +36,7 @@
 
 ### 方式二：使用 Linux 安装包
 
-从 [Actions](https://github.com/LoongSerpent9Realms/companion-ai-release/actions) 的 `Linux package` 工作流下载构件，或从 [Releases](https://github.com/LoongSerpent9Realms/companion-ai-release/releases) 下载发布包。
+从 [Releases](https://github.com/LoongSerpent9Realms/companion-ai-release/releases) 下载 Linux `.deb`/`.tar.gz` 或 Windows 安装包。每次推送匹配 `version.txt` 的 `v*` 标签后，GitHub Actions 会自动构建 Linux 和 Windows 包，并创建新的 Release。
 
 Debian/Ubuntu：
 
@@ -205,6 +205,17 @@ chmod +x build_linux.sh packaging/linux/*.sh packaging/linux/companion-ai
 companion-ai-<version>-linux-<arch>.deb
 companion-ai-<version>-linux-<arch>.tar.gz
 ```
+
+### 自动发布
+
+更新 `version.txt` 后提交并推送对应标签：
+
+```bash
+git tag v1.0.43
+git push origin main v1.0.43
+```
+
+标签必须与 `version.txt` 完全一致。工作流会等待 Linux 和 Windows 构建都成功后，自动创建 GitHub Release 并上传全部安装包。手动运行工作流只构建并上传构件，不会创建 Release。
 
 ## 项目结构
 
