@@ -1,0 +1,27 @@
+Companion AI Privacy Policy and Local Data Notice
+Effective date: July 13, 2026
+
+Please read this notice before installing or using the application.
+
+1. Data the application may process
+
+- Content entered in chat, feedback, corrections, training samples, and long-term memory.
+- Files, images, and web addresses that you choose to upload, plus summaries produced by local OCR or file parsing.
+- Screen observation, camera observation, routine records, and computer-operation learning records only after you explicitly trigger or enable the relevant feature.
+- AI identity, persona, desktop pet display, voice, plugin, and model settings that you configure.
+
+2. Storage and use of data
+
+This data is stored by default in the local CompanionAI application-data directory and is used for local chat, memory, self-training, file review, and the desktop pet experience. The application does not automatically access your screen, camera, microphone, or files without the applicable system permission and your use of the relevant feature.
+
+3. Network and third-party services
+
+Core chat runs locally by default. Package downloads, update checks, weather, web reading, component installation, optional voice features, and external model interfaces may contact external services only when you use the corresponding feature or provide its configuration. LAN access, external tunnels, and plugin services must also be enabled or configured by you.
+
+4. Your choices and controls
+
+You can manage, correct, or delete some records within the application and can manage local data through the application-data directory. If you do not accept this privacy policy, chat, uploads, visual observation, and related features will remain unavailable; you may exit setup or the application.
+
+5. Updates
+
+This notice may be updated as features change. The application will request confirmation again when needed. More information about the privacy architecture is available on the Companion AI privacy page.

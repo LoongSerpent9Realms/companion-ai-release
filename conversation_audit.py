@@ -22,12 +22,14 @@ from pathlib import Path
 from typing import Any
 
 from _paths import module_root, data_dir
+from sensitive_json import read_sensitive_json
 
 _ROOT = module_root(__file__)
 DATA_DIR = data_dir(_ROOT)
 AUDIT_CONFIG_FILE = DATA_DIR / "audit_config.json"
 AUDIT_RESULTS_FILE = DATA_DIR / "audit_results.jsonl"
 AUDIT_SUMMARY_FILE = DATA_DIR / "audit_summary.json"
+IDENTITY_FILE = DATA_DIR / "identity.json"
 
 # Thread lock for file writes
 _write_lock = threading.Lock()
@@ -37,6 +39,13 @@ _audit_queue: list[dict] = []
 _queue_lock = threading.Lock()
 _audit_thread: threading.Thread | None = None
 _running = False
+_current_audit_id: str | None = None
+_current_audit_status: str | None = None
+_status_lock = threading.Lock()
+
+# Pending corrections that haven't been pushed to the chat UI yet
+_pending_corrections: list[dict] = []
+_corrections_lock = threading.Lock()
 
 
 # ── Configuration ─────────────────────────────────────────────────────
@@ -45,6 +54,7 @@ def load_audit_config() -> dict:
     """Load audit configuration from file."""
     default = {
         "enabled": True,
+        "use_cloud_audit": False,
         "api_provider": "openai_compatible",
         "api_base": "https://api.openai.com/v1",
         "api_key": "",
@@ -80,10 +90,58 @@ def save_audit_config(config: dict) -> None:
 def is_audit_enabled() -> bool:
     """Check if audit is enabled and configured."""
     config = load_audit_config()
-    return bool(config.get("enabled")) and (bool(config.get("api_key")) or bool(config.get("local_fallback")))
+    return bool(config.get("enabled")) and (bool(config.get("local_fallback", True)) or (bool(config.get("use_cloud_audit")) and bool(config.get("api_key"))))
 
 
 # ── AI API Call ───────────────────────────────────────────────────────
+
+def _message_text(message: Any) -> str:
+    """Extract assistant text from OpenAI-compatible message payloads.
+
+    Local reasoning models (e.g. Qwen3) often put the usable answer in
+    ``reasoning_content`` while leaving ``content`` empty. Some providers
+    also return content as a list of text parts.
+    """
+    if message is None:
+        return ""
+    if isinstance(message, str):
+        return message.strip()
+    if not isinstance(message, dict):
+        return str(message).strip()
+
+    parts: list[str] = []
+    for key in ("content", "reasoning_content", "reasoning", "text", "output_text"):
+        value = message.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                parts.append(text)
+            continue
+        if isinstance(value, list):
+            chunks: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    chunk = item.strip()
+                elif isinstance(item, dict):
+                    chunk = str(
+                        item.get("text")
+                        or item.get("content")
+                        or item.get("value")
+                        or ""
+                    ).strip()
+                else:
+                    chunk = str(item or "").strip()
+                if chunk:
+                    chunks.append(chunk)
+            joined = "\n".join(chunks).strip()
+            if joined:
+                parts.append(joined)
+    if not parts:
+        return ""
+    return parts[0]
+
 
 def call_ai_api(config: dict, system_prompt: str, user_prompt: str) -> str | None:
     """Call an OpenAI-compatible API."""
@@ -105,7 +163,8 @@ def call_ai_api(config: dict, system_prompt: str, user_prompt: str) -> str | Non
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 1024,
+        # Reasoning models burn tokens in hidden thinking; keep headroom for JSON.
+        "max_tokens": int(config.get("max_tokens") or config.get("audit_max_tokens") or 2048),
     }).encode("utf-8")
 
     headers = {
@@ -114,13 +173,22 @@ def call_ai_api(config: dict, system_prompt: str, user_prompt: str) -> str | Non
     }
 
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    timeout = float(config.get("timeout") or config.get("audit_timeout") or 120)
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             choices = data.get("choices", [])
             if choices:
-                return choices[0].get("message", {}).get("content", "")
+                choice = choices[0] if isinstance(choices[0], dict) else {}
+                message = choice.get("message") if isinstance(choice, dict) else None
+                text = _message_text(message)
+                if not text and isinstance(choice, dict):
+                    text = _message_text(choice)
+                if text:
+                    return text
+                print("[audit] API returned empty assistant content/reasoning_content")
+                return None
     except Exception as e:
         print(f"[audit] API call failed: {e}")
         return None
@@ -130,20 +198,21 @@ def call_ai_api(config: dict, system_prompt: str, user_prompt: str) -> str | Non
 
 # ── Audit Logic ───────────────────────────────────────────────────────
 
-AUDIT_SYSTEM_PROMPT = """你是一个对话质量审计专家。你的任务是审计用户与AI助手之间的对话，重点检查：
-1) AI回复语句的正确性
-2) AI对用户情感判断的正确性
+AUDIT_SYSTEM_PROMPT = """你是一个对话质量审计与改进专家。你的任务是：
+1) 分析用户与AI助手之间的对话，给出准确的情感判定
+2) 评估AI回复的正确性和质量
+3) **当AI回复存在问题时，必须给出可直接训练的正确回复**
 
 你需要分析以下内容并以JSON格式返回：
 
 1. **用户情感分析** (user_sentiment):
-   - emotion: 用户的主要情绪 (如：平静、开心、难过、焦虑、愤怒、困惑、期待等)
+   - emotion: 用户的真实情绪 (如：平静、开心、难过、焦虑、愤怒、困惑、期待、好奇等)
    - polarity: 正面/中性/负面
    - intensity: 1-5 (情绪强度)
 
 2. **AI情感判断准确性** (sentiment_judgment):
    - detected_emotion: AI回复中体现出的对用户情绪的判断（如果AI没有明确表达情绪判断则为null）
-   - correct: AI的情感判断是否正确 (true/false/null)
+   - correct: AI的情感判断是否与你分析的一致 (true/false/null)
    - explanation: 情感判断正确或错误的原因说明
 
 3. **AI回复情感分析** (ai_sentiment):
@@ -166,15 +235,48 @@ AUDIT_SYSTEM_PROMPT = """你是一个对话质量审计专家。你的任务是�
 
 6. **改进建议** (suggestions):
    - 数组，每条是一个具体的改进建议，包括：
-     * 如果情感判断错误，建议如何改进情感识别
-     * 如果回复内容错误，建议正确的回答方向
+     * 正确的情感判定应该是什么
+     * 如果回复内容错误，正确的回答方向是什么
+     * 如何改进回复质量
 
 7. **建议改写** (suggested_response):
-   - 如果当前回复不应该被直接训练，请给出一条可直接训练的理想回复
-   - 必须遵守用户原始要求（例如字数、语气、只输出一句等）
-   - 如果当前回复已经合格，则返回空字符串
+   - **这是最重要的部分！** 如果AI回复存在任何问题（情感判断错误、回答不完整、语气不当、暴露内部思考等），必须给出一条可直接训练的理想回复
+   - 理想回复必须：正确识别用户情绪、自然回应、不暴露内部思考过程、遵守用户原始要求（例如字数、语气、只输出一句等）
+   - 如果当前回复已经完全合格（overall_correctness >= 0.8 且 overall_score >= 0.8），则返回空字符串
+   - 否则**必须**提供具体的改进回复
 
-请严格以JSON格式返回，不要包含其他内容。"""
+8. 如果上下文提供了“AI 身份设定”，suggested_response 必须自然保留其中的名字、关系身份和人设语气，不能退化成通用客服式 AI 自我介绍。
+
+请严格以JSON格式返回，不要包含其他内容。
+最终答案必须是完整 JSON 对象本身；不要只把 JSON 写在思考过程里。"""
+
+
+def _audit_identity_context() -> str:
+    """Return the local companion identity relevant to a rewrite, if configured."""
+    try:
+        identity = read_sensitive_json(IDENTITY_FILE, {})
+    except Exception:
+        identity = {}
+    if not isinstance(identity, dict):
+        return ""
+    name = str(identity.get("name") or "").strip()
+    if not name:
+        return ""
+    relation = str(identity.get("relationship_label") or "").strip()
+    if not relation:
+        relation = {
+            "friend": "朋友", "family": "家人", "partner": "搭档",
+            "guardian": "守护者", "lifeform": "数字生命",
+        }.get(str(identity.get("relationship_type") or ""), "陪伴伙伴")
+    subtype = str(identity.get("relationship_subtype") or "").strip()
+    persona = str(identity.get("persona") or "").strip()
+    worldview = str(identity.get("worldview") or "").strip()
+    lines = [f"名字：{name}", f"关系身份：{subtype or relation}"]
+    if persona:
+        lines.append(f"人设：{persona[:500]}")
+    if worldview:
+        lines.append(f"背景：{worldview[:500]}")
+    return "\n".join(lines)
 
 
 def _local_audit(user_message: str, ai_reply: str) -> dict:
@@ -245,10 +347,18 @@ def _local_audit(user_message: str, ai_reply: str) -> dict:
         clarity = min(clarity, 0.5)
         suggestions.append("这条回复没有完成用户要求，建议点击“改正并训练”，写入一条符合原指令的理想回复。")
 
-    if ("只输出一句" in user_message or "一句" in user_message) and "\n" in ai_reply.strip():
-        answer_complete = min(answer_complete, 0.45)
-        clarity = min(clarity, 0.45)
-        suggestions.append("用户要求只输出一句话，回复应避免多段或额外说明。")
+    wants_one_sentence = any(token in user_message for token in ("只输出一句", "只回复一句", "一句话", "只说一句", "一句"))
+    reply_paragraphs = [p for p in re.split(r"\n\s*\n", ai_reply.strip()) if p.strip()]
+    has_meta_prefix = any(marker in ai_reply for marker in ("情感理解：", "回应策略：", "我先判断这是"))
+    if wants_one_sentence and (len(reply_paragraphs) > 1 or "\n" in ai_reply.strip() or has_meta_prefix):
+        answer_complete = min(answer_complete, 0.35)
+        clarity = min(clarity, 0.35)
+        helpfulness = min(helpfulness, 0.45)
+        suggestions.append("用户要求只输出一句话，回复应避免多段、元说明或额外铺垫。")
+    elif has_meta_prefix and len(reply_paragraphs) > 1:
+        answer_complete = min(answer_complete, 0.5)
+        clarity = min(clarity, 0.5)
+        suggestions.append("回复包含情感元说明和多段铺垫，建议改成直接可训练的最终答案。")
 
     max_len_match = re.search(r"不(?:要|超过|多于|超過)\s*(\d+)\s*个?字", user_message)
     if max_len_match:
@@ -299,57 +409,94 @@ def _extract_json_object(text: str) -> dict | None:
     if raw.startswith("```"):
         lines = raw.split("\n")
         raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+    # Reasoning models sometimes wrap the JSON after a long chain-of-thought.
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.S | re.I)
+    if fence:
+        raw = fence.group(1).strip()
     try:
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
         pass
 
-    start = raw.find("{")
-    if start < 0:
+    # Scan every object start; prefer the last successfully parsed dict.
+    candidates: list[dict] = []
+    for start in [idx for idx, ch in enumerate(raw) if ch == "{"]:
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(raw)):
+            char = raw[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = raw[start:index + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            candidates.append(parsed)
+                    except json.JSONDecodeError:
+                        pass
+                    break
+    if not candidates:
         return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(raw)):
-        char = raw[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = raw[start:index + 1]
-                try:
-                    parsed = json.loads(candidate)
-                    return parsed if isinstance(parsed, dict) else None
-                except json.JSONDecodeError:
-                    return None
-    return None
+    # Prefer objects that look like audit/correction payloads.
+    preferred_keys = {
+        "ai_quality", "ai_correctness", "user_sentiment", "suggested_response",
+        "suggestions", "sentiment_judgment",
+    }
+    scored = sorted(
+        candidates,
+        key=lambda item: sum(1 for key in preferred_keys if key in item),
+        reverse=True,
+    )
+    return scored[0]
 
 
-AUDIT_CORRECTION_SYSTEM_PROMPT = """你是一个负责把审计结果转成训练样本的改写助手。
-你的任务：根据用户原始输入、AI原回复和审计结果，写出一条可直接作为正确训练答案的 suggested_response。
-要求：
-1. 只修正 AI 应该如何回复，不解释审计流程。
-2. 必须遵守用户原始输入中的格式、语气、字数、角色和输出限制。
-3. 如果用户要求一句话，就只给一句话。
-4. 如果无法确定理想回复，给出最稳妥、自然、可训练的一条回复。
+AUDIT_CORRECTION_SYSTEM_PROMPT = """你是一个对话改写专家。你的任务：根据用户原始输入、AI原回复和审计结果，写出一条可直接作为正确训练答案的 suggested_response。
+
+**核心要求：**
+1. 回复必须自然、拟人化，像真人对话一样，**绝对不能**暴露任何内部思考过程（如情感分析、置信度、策略说明等）。
+2. 必须正确识别并回应用户的真实情绪，保持适当的共情。
+3. 必须遵守用户原始输入中的格式、语气、字数、角色和输出限制。
+4. 如果用户要求一句话，就只给一句话。
+5. 如果原回复已经合格（overall_correctness >= 0.8 且 overall_score >= 0.8），返回空字符串。
+6. 否则**必须**提供具体的改进回复。
+7. 如果输入包含 AI 身份设定，回复必须使用该名字、关系身份和人设语气；绝不能改写成泛化的客服/通用 AI 自我介绍。
 
 请严格返回 JSON：
 {
   "suggested_response": "可直接训练的理想回复",
   "reason": "一句话说明为什么这样改"
 }"""
+
+
+def _trainable_suggested_response(value: object) -> str:
+    """Accept only a direct end-user reply, never an audit analysis as training data."""
+    text = str(value or "").strip()
+    if not text or len(text) > 1200:
+        return ""
+    forbidden = (
+        "用户问的是", "用户原始输入", "ai原回复", "ai 原回复", "审计结果",
+        "改写建议", "改写原因", "内部思考", "情感理解", "回应策略", "评分：",
+        "建议：", "suggested_response", "```",
+    )
+    lowered = text.lower()
+    if any(marker in lowered for marker in forbidden):
+        return ""
+    return text
 
 
 def _score_value(result: dict, section: str, key: str) -> float | None:
@@ -389,20 +536,33 @@ def _generate_correction_suggestion(
         "sentiment_judgment": audit_result.get("sentiment_judgment", {}),
         "suggestions": audit_result.get("suggestions", []),
     }
+    identity_context = _audit_identity_context()
     prompt = (
         "请根据以下审计结果生成一条可直接训练的改写回复。\n\n"
         f"用户原始输入：\n{user_message}\n\n"
         f"AI原回复：\n{ai_reply}\n\n"
         f"审计结果：\n{json.dumps(audit_brief, ensure_ascii=False)}"
     )
+    if identity_context:
+        prompt += f"\n\nAI 身份设定（改写必须遵守）：\n{identity_context}"
     response = call_ai_api(config, AUDIT_CORRECTION_SYSTEM_PROMPT, prompt)
     if not response:
         return None
     parsed = _extract_json_object(response)
-    if not parsed:
-        text = response.strip()
-        return {"suggested_response": text, "reason": "审计 AI 生成的改写建议"} if text else None
-    suggestion = str(parsed.get("suggested_response") or "").strip()
+    suggestion = _trainable_suggested_response(
+        parsed.get("suggested_response") if parsed else response
+    )
+    if not suggestion:
+        retry_prompt = (
+            prompt
+            + "\n\n上一条输出不合格。现在只返回一条直接对用户说的话，不要解释审计、问题、评分、建议或改写过程；"
+              "仍严格返回 {\"suggested_response\":\"...\",\"reason\":\"...\"}。"
+        )
+        retry_response = call_ai_api(config, AUDIT_CORRECTION_SYSTEM_PROMPT, retry_prompt)
+        parsed = _extract_json_object(retry_response or "") if retry_response else None
+        suggestion = _trainable_suggested_response(
+            parsed.get("suggested_response") if parsed else retry_response
+        )
     if not suggestion:
         return None
     return {
@@ -422,8 +582,13 @@ def _attach_review_metadata(
     threshold = float(config.get("correction_threshold", 0.65) or 0.65)
     result["needs_user_action"] = _needs_user_action(result, threshold)
     result["correction_threshold"] = threshold
+    has_api = bool(str(config.get("api_key") or "").strip())
+    existing_suggestion = str(result.get("suggested_response") or "").strip()
+    if existing_suggestion and not _trainable_suggested_response(existing_suggestion):
+        result["suggested_response"] = ""
+        result["correction_error"] = "审计 AI 返回了分析文本，不会作为训练建议保存"
     if (
-        allow_api
+        allow_api and has_api
         and result["needs_user_action"]
         and config.get("auto_suggest_corrections")
         and not str(result.get("suggested_response") or "").strip()
@@ -434,7 +599,63 @@ def _attach_review_metadata(
             if correction.get("reason"):
                 result["correction_reason"] = correction["reason"]
             result["correction_source"] = "audit_ai"
+        else:
+            result["correction_error"] = "审计 AI 改写建议请求失败或返回为空"
+    elif (
+        result["needs_user_action"]
+        and config.get("auto_suggest_corrections")
+        and not str(result.get("suggested_response") or "").strip()
+        and not has_api
+    ):
+        result["correction_error"] = "未配置审计 API Key，无法请求改写建议"
+
+    # Automatic learning is intentionally limited to an external audit that
+    # supplied an answer ready for training. Local fallback findings and audit
+    # results without a replacement remain in the human review workflow.
+    suggested = str(result.get("suggested_response") or "").strip()
+    if (
+        allow_api
+        and config.get("auto_suggest_corrections")
+        and result.get("audit_source") == "api"
+        and suggested
+    ):
+        result["auto_apply_suggested_correction"] = True
+        result["review_status"] = "auto_applied"
     return result
+
+
+
+def _normalize_history(history: list | None, max_turns: int = 6) -> list[tuple[str, str]]:
+    """Accept tuple history or chat history dicts and return (user, ai) pairs."""
+    if not history:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for item in history:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            user_msg = str(item[0] or "").strip()
+            ai_msg = str(item[1] or "").strip()
+            if user_msg or ai_msg:
+                pairs.append((user_msg, ai_msg))
+            continue
+        if isinstance(item, dict):
+            user_msg = str(
+                item.get("user")
+                or item.get("user_message")
+                or item.get("message")
+                or item.get("prompt")
+                or ""
+            ).strip()
+            ai_msg = str(
+                item.get("assistant")
+                or item.get("ai")
+                or item.get("ai_reply")
+                or item.get("reply")
+                or item.get("response")
+                or ""
+            ).strip()
+            if user_msg or ai_msg:
+                pairs.append((user_msg, ai_msg))
+    return pairs[-max(1, int(max_turns or 1)):]
 
 
 def audit_conversation(
@@ -452,19 +673,28 @@ def audit_conversation(
 
     api_key = config.get("api_key", "")
     local_fallback = config.get("local_fallback", True)
+    allow_api = bool(config.get("use_cloud_audit", False)) and bool(str(api_key or "").strip())
 
-    if not api_key and local_fallback:
+    if not allow_api and local_fallback:
         result = _local_audit(user_message, ai_reply)
         result["timestamp"] = datetime.now().isoformat()
         result["user_message"] = user_message[:500]
         result["ai_reply"] = ai_reply[:500]
-        return _attach_review_metadata(result, user_message, ai_reply, config, allow_api=False)
+        result["audit_error"] = "本地规则审计模式（云端审计未启用）"
+        return _attach_review_metadata(result, user_message, ai_reply, config, allow_api=allow_api)
+    if not allow_api:
+        return None
 
     # Build context
     context_parts = []
-    if history:
-        for i, (user_msg, ai_msg) in enumerate(history[-config.get("max_context_turns", 3):]):
+    identity_context = _audit_identity_context()
+    if identity_context:
+        context_parts.append(f"[AI 身份设定]\n{identity_context}")
+    max_turns = int(config.get("max_context_turns", 3) or 3)
+    for user_msg, ai_msg in _normalize_history(history, max_turns):
+        if user_msg:
             context_parts.append(f"用户: {user_msg}")
+        if ai_msg:
             context_parts.append(f"AI: {ai_msg}")
 
     context_parts.append(f"用户: {user_message}")
@@ -479,7 +709,9 @@ def audit_conversation(
             result["timestamp"] = datetime.now().isoformat()
             result["user_message"] = user_message[:500]
             result["ai_reply"] = ai_reply[:500]
-            return _attach_review_metadata(result, user_message, ai_reply, config, allow_api=False)
+            result["audit_error"] = "审计 AI 调用失败或返回空内容，已回退本地规则审计"
+            # Still allow a second-chance rewrite request when auto-suggest is on.
+            return _attach_review_metadata(result, user_message, ai_reply, config, allow_api=allow_api)
         return None
 
     result = _extract_json_object(response)
@@ -487,7 +719,8 @@ def audit_conversation(
         result["timestamp"] = datetime.now().isoformat()
         result["user_message"] = user_message[:500]  # Truncate for storage
         result["ai_reply"] = ai_reply[:500]
-        return _attach_review_metadata(result, user_message, ai_reply, config, allow_api=True)
+        result["audit_source"] = "api"
+        return _attach_review_metadata(result, user_message, ai_reply, config, allow_api=allow_api)
 
     print(f"[audit] Failed to parse audit result: {response[:200]}")
     if local_fallback:
@@ -496,7 +729,8 @@ def audit_conversation(
         result["user_message"] = user_message[:500]
         result["ai_reply"] = ai_reply[:500]
         result["audit_parse_error"] = response[:500]
-        return _attach_review_metadata(result, user_message, ai_reply, config, allow_api=False)
+        result["audit_error"] = "审计 AI 返回无法解析为 JSON，已回退本地规则审计"
+        return _attach_review_metadata(result, user_message, ai_reply, config, allow_api=allow_api)
     return None
 
 
@@ -504,7 +738,7 @@ def audit_conversation(
 
 def _audit_worker():
     """Background thread that processes audit queue."""
-    global _running
+    global _running, _current_audit_id, _current_audit_status
 
     while _running:
         config = load_audit_config()
@@ -520,21 +754,47 @@ def _audit_worker():
 
         for item in items:
             try:
+                audit_id = item.get("audit_id")
+                with _status_lock:
+                    _current_audit_id = audit_id
+                    _current_audit_status = "processing"
+                
                 result = audit_conversation(
                     item["user_message"],
                     item["ai_reply"],
                     item.get("history"),
                     config,
                 )
+                
+                with _status_lock:
+                    if _current_audit_id == audit_id:
+                        _current_audit_status = "completed" if result else "failed"
+                
                 if result:
                     if item.get("audit_id"):
                         result["audit_id"] = item["audit_id"]
                     _save_audit_result(result)
+                    print(
+                        f"[audit] saved source={result.get('audit_source')} "
+                        f"needs={result.get('needs_user_action')} "
+                        f"id={result.get('audit_id')}"
+                    )
             except Exception as e:
+                with _status_lock:
+                    _current_audit_status = "failed"
                 print(f"[audit] Worker error: {e}")
+                traceback.print_exc()
 
-        # Rate limiting
-        time.sleep(config.get("audit_interval", 10))
+        # Rate limiting only when queue is idle after this batch.
+        with _queue_lock:
+            pending = len(_audit_queue)
+        if pending == 0:
+            with _status_lock:
+                _current_audit_id = None
+                _current_audit_status = None
+            time.sleep(config.get("audit_interval", 10))
+        else:
+            time.sleep(0.2)
 
 
 def _save_audit_result(result: dict) -> None:
@@ -564,6 +824,24 @@ def _save_audit_result(result: dict) -> None:
     _update_summary(result)
     _apply_to_growth(result)
     _apply_to_training(result)
+
+    # Push correction to pending buffer if there's a suggested_response
+    suggested = str(result.get("suggested_response") or "").strip()
+    if (
+        suggested
+        and result.get("needs_user_action")
+        and not result.get("auto_apply_suggested_correction")
+    ):
+        with _corrections_lock:
+            _pending_corrections.append({
+                "audit_id": result.get("audit_id", ""),
+                "user_message": result.get("user_message", ""),
+                "original_reply": result.get("ai_reply", ""),
+                "suggested_response": suggested,
+                "reason": result.get("correction_reason", ""),
+                "overall_correctness": _score_value(result, "ai_correctness", "overall_correctness"),
+                "overall_score": _score_value(result, "ai_quality", "overall_score"),
+            })
 
 
 def _conversation_audit_id(user_message: str, ai_reply: str) -> str:
@@ -600,10 +878,16 @@ def _apply_to_growth(result: dict) -> None:
 
 
 def _apply_to_training(result: dict) -> None:
-    """Apply audit result to local training feedback/examples."""
+    """Persist an automatically accepted cloud rewrite as a training example."""
+    if not result.get("auto_apply_suggested_correction"):
+        return
     try:
         from audit_training import record_audit_training
-        record_audit_training(result, decision="auto")
+        record_audit_training(
+            result,
+            decision="auto_correct",
+            corrected_response=str(result.get("suggested_response") or ""),
+        )
     except ImportError:
         print("[audit] audit_training module not found")
     except Exception as e:
@@ -727,10 +1011,11 @@ def submit_audit(
     with _queue_lock:
         if any(item.get("audit_id") == audit_id for item in _audit_queue):
             return
+        config = load_audit_config()
         _audit_queue.append({
             "user_message": user_message,
             "ai_reply": ai_reply,
-            "history": history,
+            "history": _normalize_history(history, int(config.get("max_context_turns", 6) or 6)),
             "audit_id": audit_id,
         })
 
@@ -749,24 +1034,52 @@ def get_recent_audits(limit: int = 10) -> list[dict]:
     """Get recent audit results."""
     if not AUDIT_RESULTS_FILE.exists():
         return []
-    results = []
+    results: list[dict] = []
     with _write_lock:
-        lines = AUDIT_RESULTS_FILE.read_text(encoding="utf-8").strip().split("\n")
-        for line in lines[-limit:]:
-            if line.strip():
-                try:
-                    item = json.loads(line)
-                    if not item.get("audit_id"):
-                        seed = "|".join([
-                            str(item.get("timestamp") or ""),
-                            str(item.get("user_message") or ""),
-                            str(item.get("ai_reply") or ""),
-                        ])
-                        item["audit_id"] = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
-                    results.append(item)
-                except Exception:
-                    pass
-    return results
+        try:
+            lines = AUDIT_RESULTS_FILE.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(item, dict):
+            continue
+        if not item.get("audit_id"):
+            item["audit_id"] = _conversation_audit_id(
+                str(item.get("user_message") or ""),
+                str(item.get("ai_reply") or ""),
+            )
+        existing_suggestion = str(item.get("suggested_response") or "").strip()
+        if existing_suggestion and not _trainable_suggested_response(existing_suggestion):
+            item["suggested_response"] = ""
+            item["correction_error"] = "审计 AI 返回了分析文本，不会作为训练建议保存"
+        results.append(item)
+    return sorted(results, key=lambda item: str(item.get("timestamp") or ""), reverse=True)[:limit]
+
+
+def get_audit_status() -> dict:
+    """Get current audit status for UI display."""
+    global _current_audit_id, _current_audit_status
+    status = {
+        "enabled": is_audit_enabled(),
+        "worker_running": False,
+        "queue_size": 0,
+        "current_audit_id": None,
+        "current_status": None,
+    }
+    if _audit_thread and _audit_thread.is_alive():
+        status["worker_running"] = True
+    with _queue_lock:
+        status["queue_size"] = len(_audit_queue)
+    with _status_lock:
+        status["current_audit_id"] = _current_audit_id
+        status["current_status"] = _current_audit_status
+    return status
 
 
 def get_audit_context_for_chat() -> str:
@@ -849,6 +1162,7 @@ def handle_audit_command(message: str) -> dict | None:
         lines = [
             "对话审计状态：",
             f"  启用：{'是' if enabled else '否'}",
+            f"  模式：{'云端辅助' if config.get('use_cloud_audit') else '本地规则（默认）'}",
             f"  API: {config.get('api_base', '未设置')}",
             f"  模型：{config.get('model', '未设置')}",
             f"  已审计：{summary.get('total_audits', 0)} 条",
@@ -893,11 +1207,18 @@ def handle_audit_command(message: str) -> dict | None:
 
     if message == "/audit_enable":
         config = load_audit_config()
-        if not config.get("api_key"):
-            return {"reply": "请先配置审计 API Key。\n编辑 data/audit_config.json 填入 api_key。"}
         config["enabled"] = not config.get("enabled", False)
         save_audit_config(config)
         return {"reply": f"审计已{'启用' if config['enabled'] else '禁用'}。"}
+
+    if message in {"/audit_cloud_on", "/audit_cloud_off"}:
+        config = load_audit_config()
+        enabled = message == "/audit_cloud_on"
+        if enabled and not config.get("api_key"):
+            return {"reply": "未配置审计 API Key，无法启用云端审计。"}
+        config["use_cloud_audit"] = enabled
+        save_audit_config(config)
+        return {"reply": "已启用云端审计辅助。" if enabled else "已切回本地规则审计。"}
 
     if message == "/audit_config":
         config = load_audit_config()
@@ -925,3 +1246,14 @@ def handle_audit_command(message: str) -> dict | None:
         return {"reply": "\n".join(lines)}
 
     return None
+
+
+def get_pending_corrections() -> list[dict]:
+    """Return and clear pending audit corrections for the chat UI.
+
+    Each call drains the buffer so corrections are shown only once.
+    """
+    with _corrections_lock:
+        corrections = list(_pending_corrections)
+        _pending_corrections.clear()
+    return corrections

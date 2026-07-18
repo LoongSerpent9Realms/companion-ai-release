@@ -45,9 +45,22 @@ CHAT_MODES = {
         "requires_training": True,
         "requires_gpu": False,  # CPU 也可以，只是慢
     },
+    "sparse_tiny_llm": {
+        "name": "稀疏增强模式",
+        "description": "稀疏注意力 + 盘古 pi 级数激活与增强短路；兼容旧稀疏权重",
+        "requires_training": True,
+        "requires_gpu": False,
+    },
+    "pangu_pi_sparse_tiny_llm": {
+        "name": "盘古 pi 稀疏模式",
+        "description": "稀疏注意力 + 增强短路 + 级数激活；需要单独训练",
+        "requires_training": True,
+        "requires_gpu": False,
+        "hidden": True,
+    },
     "hybrid": {
         "name": "混合模式",
-        "description": "检索 + Tiny LLM + 规则，效果最好",
+        "description": "检索 + 可用大模型 + 盘古 pi/稀疏 Tiny LLM + 规则",
         "requires_training": True,
         "requires_gpu": False,
     },
@@ -71,7 +84,8 @@ def get_chat_mode() -> str:
     if CHAT_MODE_FILE.exists():
         try:
             data = json.loads(CHAT_MODE_FILE.read_text(encoding="utf-8"))
-            return data.get("mode", "hybrid")
+            mode = data.get("mode", "hybrid")
+            return "sparse_tiny_llm" if mode == "pangu_pi_sparse_tiny_llm" else mode
         except Exception:
             pass
     return "hybrid"  # 默认混合模式
@@ -79,6 +93,8 @@ def get_chat_mode() -> str:
 
 def set_chat_mode(mode: str) -> dict:
     """设置对话模式。"""
+    if mode == "pangu_pi_sparse_tiny_llm":
+        mode = "sparse_tiny_llm"
     if mode not in CHAT_MODES:
         return {"ok": False, "error": f"未知模式：{mode}"}
     
@@ -95,6 +111,8 @@ def list_chat_modes() -> list[dict]:
     current = get_chat_mode()
     result = []
     for key, info in CHAT_MODES.items():
+        if info.get("hidden"):
+            continue
         result.append({
             "id": key,
             "name": info["name"],
@@ -169,12 +187,24 @@ class HybridChatbot:
         self.retrieval = None
         self.embedding_index = None
         self.tiny_llm = None
+        self.sparse_tiny_llm = None
+        self.pangu_pi_tiny_llm = None
         self.local_llm = None
         self.initialized = False
+
+    @staticmethod
+    def _tiny_reply(message: str, history: list[tuple[str, str]] | None, model) -> str:
+        """Generate a TinyLLM reply using the persisted local answer preference."""
+        try:
+            from tiny_llm import load_deep_reply_config
+            deep_reply = load_deep_reply_config()["enabled"]
+        except Exception:
+            deep_reply = False
+        return model.chat(message, history, deep_reply=deep_reply)
     
     def initialize(self) -> dict:
         """初始化各组件。"""
-        status = {"retrieval": False, "embedding": False, "tiny_llm": False, "local_llm": False}
+        status = {"retrieval": False, "embedding": False, "tiny_llm": False, "sparse_tiny_llm": False, "pangu_pi_tiny_llm": False, "local_llm": False}
         
         # 初始化 embedding 检索（优先）
         try:
@@ -206,6 +236,24 @@ class HybridChatbot:
                 status["tiny_llm"] = result.get("ok", False)
         except Exception as e:
             status["tiny_llm_error"] = str(e)
+
+        try:
+            from tiny_llm import get_sparse_tiny_llm, SPARSE_MODEL_FILE
+            if SPARSE_MODEL_FILE.exists():
+                self.sparse_tiny_llm = get_sparse_tiny_llm()
+                result = self.sparse_tiny_llm.load()
+                status["sparse_tiny_llm"] = result.get("ok", False)
+        except Exception as e:
+            status["sparse_tiny_llm_error"] = str(e)
+
+        try:
+            from tiny_llm import get_pangu_pi_tiny_llm, PANGU_PI_MODEL_FILE
+            if PANGU_PI_MODEL_FILE.exists():
+                self.pangu_pi_tiny_llm = get_pangu_pi_tiny_llm()
+                result = self.pangu_pi_tiny_llm.load()
+                status["pangu_pi_tiny_llm"] = result.get("ok", False)
+        except Exception as e:
+            status["pangu_pi_tiny_llm_error"] = str(e)
         
         # 初始化本地 LLM (大模型)
         try:
@@ -279,10 +327,46 @@ class HybridChatbot:
         # 2. Tiny LLM 模式
         if mode == "tiny_llm":
             if self.tiny_llm and self.tiny_llm.loaded:
-                reply = self.tiny_llm.chat(message, history)
+                reply = self._tiny_reply(message, history, self.tiny_llm)
                 if reply and reply != "...":
                     return reply, "tiny_llm"
             # 回退到检索
+            if self.embedding_index and self.embedding_index.loaded:
+                match, score = self.embedding_index.get_best_match(retrieval_query, threshold=0.4)
+                if match:
+                    return match.get("response", ""), "embedding"
+            if self.retrieval:
+                reply = self.retrieval.chat(retrieval_query, history)
+                if reply:
+                    return reply, "retrieval"
+            return self._fallback_reply(retrieval_query), "rules"
+
+        # 2.1 Sparse Tiny LLM mode. It uses separately trained weights so a
+        # dense checkpoint can never be loaded into the sparse architecture.
+        if mode == "sparse_tiny_llm":
+            if self.pangu_pi_tiny_llm and self.pangu_pi_tiny_llm.loaded:
+                reply = self._tiny_reply(message, history, self.pangu_pi_tiny_llm)
+                if reply and reply != "...":
+                    return reply, "pangu_pi_sparse_tiny_llm"
+            if self.sparse_tiny_llm and self.sparse_tiny_llm.loaded:
+                reply = self._tiny_reply(message, history, self.sparse_tiny_llm)
+                if reply and reply != "...":
+                    return reply, "sparse_tiny_llm"
+            if self.embedding_index and self.embedding_index.loaded:
+                match, score = self.embedding_index.get_best_match(retrieval_query, threshold=0.4)
+                if match:
+                    return match.get("response", ""), "embedding"
+            if self.retrieval:
+                reply = self.retrieval.chat(retrieval_query, history)
+                if reply:
+                    return reply, "retrieval"
+            return self._fallback_reply(retrieval_query), "rules"
+
+        if mode == "pangu_pi_sparse_tiny_llm":
+            if self.pangu_pi_tiny_llm and self.pangu_pi_tiny_llm.loaded:
+                reply = self._tiny_reply(message, history, self.pangu_pi_tiny_llm)
+                if reply and reply != "...":
+                    return reply, "pangu_pi_sparse_tiny_llm"
             if self.embedding_index and self.embedding_index.loaded:
                 match, score = self.embedding_index.get_best_match(retrieval_query, threshold=0.4)
                 if match:
@@ -327,50 +411,60 @@ class HybridChatbot:
             return self._fallback_reply(retrieval_query), "rules"
         
         # 5. 混合模式 (默认)
-        # 5.1 先尝试 embedding 高置信度匹配
-        if self.embedding_index and self.embedding_index.loaded:
-            match, score = self.embedding_index.get_best_match(retrieval_query, threshold=0.6)
-            if match:
-                return match.get("response", ""), "embedding"
-        
-        # 5.2 尝试传统检索高置信度匹配
-        if self.retrieval:
-            match, score = self.retrieval.index.get_best_match(retrieval_query, threshold=0.5)
-            if match:
-                return match.get("response", ""), "retrieval"
-        
-        # 5.3 尝试本地大模型
+        # 5.1 尝试本地大模型
         if self.local_llm and self.local_llm.loaded:
             reply = self.local_llm.chat(message, history)
             if reply and not reply.startswith("["):
                 return reply, "local_llm"
         
-        # 5.4 尝试大模型接口
+        # 5.2 尝试大模型接口
         remote_config = load_remote_llm_config()
         if remote_config.get("enabled_for_hybrid") and is_remote_llm_ready(remote_config):
             reply = call_remote_llm(message, history, remote_config)
             if reply and not reply.startswith("["):
                 return reply, "api_llm"
 
-        # 5.5 尝试 Tiny LLM
+        # 5.3 统一的稀疏增强模型：优先盘古 pi 权重，随后兼容旧稀疏权重。
+        if self.pangu_pi_tiny_llm and self.pangu_pi_tiny_llm.loaded:
+            reply = self._tiny_reply(message, history, self.pangu_pi_tiny_llm)
+            if reply and reply != "...":
+                return reply, "pangu_pi_sparse_tiny_llm"
+
+        # 5.4 尝试普通稀疏 Tiny LLM。
+        if self.sparse_tiny_llm and self.sparse_tiny_llm.loaded:
+            reply = self._tiny_reply(message, history, self.sparse_tiny_llm)
+            if reply and reply != "...":
+                return reply, "sparse_tiny_llm"
+
+        # 5.5 高置信度检索。
+        if self.embedding_index and self.embedding_index.loaded:
+            match, score = self.embedding_index.get_best_match(retrieval_query, threshold=0.6)
+            if match:
+                return match.get("response", ""), "embedding"
+        if self.retrieval:
+            match, score = self.retrieval.index.get_best_match(retrieval_query, threshold=0.5)
+            if match:
+                return match.get("response", ""), "retrieval"
+
+        # 5.6 尝试普通 Tiny LLM
         if self.tiny_llm and self.tiny_llm.loaded:
-            reply = self.tiny_llm.chat(message, history)
+            reply = self._tiny_reply(message, history, self.tiny_llm)
             if reply and reply != "...":
                 return reply, "tiny_llm"
         
-        # 5.6 低阈值 embedding 检索
+        # 5.7 低阈值 embedding 检索
         if self.embedding_index and self.embedding_index.loaded:
             match, score = self.embedding_index.get_best_match(retrieval_query, threshold=0.35)
             if match:
                 return match.get("response", ""), "embedding"
         
-        # 5.7 低阈值传统检索
+        # 5.8 低阈值传统检索
         if self.retrieval:
             match, score = self.retrieval.index.get_best_match(retrieval_query, threshold=0.28)
             if match:
                 return match.get("response", ""), "retrieval"
         
-        # 5.8 规则兜底
+        # 5.9 规则兜底
         return self._fallback_reply(retrieval_query), "rules"
     
     def _fallback_reply(self, message: str) -> str:
@@ -393,6 +487,8 @@ class HybridChatbot:
             "embedding": self.embedding_index.stats() if self.embedding_index and self.embedding_index.loaded else None,
             "retrieval": self.retrieval.stats() if self.retrieval else None,
             "tiny_llm": self.tiny_llm.loaded if self.tiny_llm else False,
+            "sparse_tiny_llm": self.sparse_tiny_llm.loaded if self.sparse_tiny_llm else False,
+            "pangu_pi_tiny_llm": self.pangu_pi_tiny_llm.loaded if self.pangu_pi_tiny_llm else False,
             "local_llm": self.local_llm.loaded if self.local_llm else False,
             "api_llm": is_remote_llm_ready(),
         }
@@ -404,6 +500,33 @@ _hybrid_chatbot = HybridChatbot()
 
 def get_hybrid_chatbot() -> HybridChatbot:
     return _hybrid_chatbot
+
+
+def reload_tiny_models() -> dict:
+    """Reload persisted TinyLLM artifacts after a local model version switch."""
+    from tiny_llm import (
+        MODEL_FILE, PANGU_PI_MODEL_FILE, SPARSE_MODEL_FILE,
+        get_pangu_pi_tiny_llm, get_sparse_tiny_llm, get_tiny_llm,
+    )
+    targets = [
+        ("tiny_llm", get_tiny_llm, MODEL_FILE),
+        ("sparse_tiny_llm", get_sparse_tiny_llm, SPARSE_MODEL_FILE),
+        ("pangu_pi_tiny_llm", get_pangu_pi_tiny_llm, PANGU_PI_MODEL_FILE),
+    ]
+    result: dict[str, object] = {"ok": True, "models": {}}
+    for attribute, getter, path in targets:
+        model = getter()
+        model.unload()
+        if path.exists():
+            loaded = model.load()
+            result["models"][attribute] = loaded
+            if not loaded.get("ok"):
+                result["ok"] = False
+        else:
+            result["models"][attribute] = {"ok": True, "skipped": True}
+        setattr(_hybrid_chatbot, attribute, model if model.loaded else None)
+    _hybrid_chatbot.initialized = True
+    return result
 
 
 def hybrid_chat(message: str, history: list[tuple[str, str]] | None = None) -> tuple[str, str]:

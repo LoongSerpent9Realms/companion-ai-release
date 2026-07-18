@@ -36,6 +36,12 @@ jobs:
           chmod +x build_linux.sh packaging/linux/*.sh packaging/linux/companion-ai
           ./build_linux.sh
 
+      - name: Generate Linux SHA256 checksums
+        run: |
+          cd dist/linux
+          sha256sum *.deb *.tar.gz > SHA256SUMS-linux.txt
+          cat SHA256SUMS-linux.txt
+
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
         with:
@@ -86,7 +92,9 @@ jobs:
           $output = "dist\windows"
           New-Item -ItemType Directory -Force -Path $output | Out-Null
           Copy-Item "installer_output\CompanionAI-Setup.exe" "$output\CompanionAI-Setup-v$version.exe"
-          Get-FileHash "$output\CompanionAI-Setup-v$version.exe" -Algorithm SHA256 | Format-List
+          $hash = (Get-FileHash "$output\CompanionAI-Setup-v$version.exe" -Algorithm SHA256).Hash
+          "$hash  CompanionAI-Setup-v$version.exe" | Out-File -Encoding ascii "$output\SHA256SUMS-windows.txt"
+          Get-Content "$output\SHA256SUMS-windows.txt"
 
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
@@ -127,9 +135,19 @@ jobs:
 
       - name: Build macOS disk image
         shell: bash
+        env:
+          MAC_DEVELOPER_IDENTITY: ${{ secrets.MAC_DEVELOPER_IDENTITY }}
+          MAC_APPLE_ID: ${{ secrets.MAC_APPLE_ID }}
+          MAC_APP_SPECIFIC_PASSWORD: ${{ secrets.MAC_APP_SPECIFIC_PASSWORD }}
+          MAC_TEAM_ID: ${{ secrets.MAC_TEAM_ID }}
         run: |
           chmod +x build_macos.sh
-          ./build_macos.sh
+          # build_macos.sh wipes dist/macos, so capture the log outside it.
+          ./build_macos.sh 2>&1 | tee build-macos-${{ matrix.architecture }}.log
+          # Persist signing status for the release notes step.
+          grep -E "Signed:|Notarized:|NOTE:|UNSIGNED" build-macos-${{ matrix.architecture }}.log \
+            > dist/macos/sign-status-${{ matrix.architecture }}.txt || true
+          cat dist/macos/sign-status-${{ matrix.architecture }}.txt
 
       - name: Verify architecture and prepare asset
         shell: bash
@@ -142,12 +160,17 @@ jobs:
             exit 1
           }
           shasum -a 256 "$expected"
+          (cd dist/macos && shasum -a 256 *.dmg > SHA256SUMS-macos-${{ matrix.architecture }}.txt)
+          cat "dist/macos/SHA256SUMS-macos-${{ matrix.architecture }}.txt"
 
       - name: Upload macOS disk image
         uses: actions/upload-artifact@v4
         with:
           name: companion-ai-macos-${{ matrix.architecture }}
-          path: dist/macos/*.dmg
+          path: |
+            dist/macos/*.dmg
+            dist/macos/SHA256SUMS-macos-${{ matrix.architecture }}.txt
+            dist/macos/sign-status-${{ matrix.architecture }}.txt
           if-no-files-found: error
 
   create-release:
@@ -158,6 +181,9 @@ jobs:
       - build-macos
     runs-on: ubuntu-22.04
     steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
       - name: Download Linux packages
         uses: actions/download-artifact@v4
         with:
@@ -177,6 +203,75 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Build aggregated SHA256SUMS.txt
+        run: |
+          cd release-assets
+          # Combine platform-specific checksum files into a single canonical file.
+          cat SHA256SUMS-linux.txt SHA256SUMS-windows.txt SHA256SUMS-macos-x86_64.txt SHA256SUMS-macos-arm64.txt \
+            > SHA256SUMS.txt 2>/dev/null || true
+          # Re-compute any missing checksums to ensure completeness.
+          for f in *.deb *.exe *.dmg; do
+            [ -f "$f" ] || continue
+            grep -q "  $f\$" SHA256SUMS.txt || sha256sum "$f" >> SHA256SUMS.txt
+          done
+          sort -k2 -o SHA256SUMS.txt SHA256SUMS.txt
+          # Copy matching CHANGELOG into release assets.
+          version="$(tr -d '[:space:]' < ../version.txt)"
+          [ -f "../release_assets/CHANGELOG-v${version}.md" ] && cp "../release_assets/CHANGELOG-v${version}.md" .
+          echo "=== Aggregated SHA256SUMS.txt ==="
+          cat SHA256SUMS.txt
+
+      - name: Build release notes
+        run: |
+          version="$(tr -d '[:space:]' < version.txt)"
+          {
+            echo "# Companion AI v${version}"
+            echo
+            echo "## 安装包"
+            echo
+            echo "| 平台 | 文件 |"
+            echo "| --- | --- |"
+            echo "| Windows | \`CompanionAI-Setup-v${version}.exe\` |"
+            echo "| Linux (deb) | \`companion-ai-${version}-linux-x86_64.deb\` |"
+            echo "| Linux (tar.gz) | \`companion-ai-${version}-linux-x86_64.tar.gz\` |"
+            echo "| macOS (Intel) | \`companion-ai-${version}-macos-x86_64.dmg\` |"
+            echo "| macOS (Apple Silicon) | \`companion-ai-${version}-macos-arm64.dmg\` |"
+            echo
+            echo "## SHA256 校验"
+            echo
+            echo "请下载 \`SHA256SUMS.txt\` 并使用 \`sha256sum -c SHA256SUMS.txt\` 验证安装包完整性。"
+            echo
+            echo "## 签名状态"
+            echo
+            echo "| 平台 | 签名 |"
+            echo "| --- | --- |"
+            echo "| Windows | 未签名（本地构建） |"
+            # macOS signing status from build logs
+            for arch in x86_64 arm64; do
+              status_file="release-assets/sign-status-${arch}.txt"
+              if [ -f "$status_file" ]; then
+                if grep -q "Signed: 1" "$status_file" && grep -q "Notarized: 1" "$status_file"; then
+                  echo "| macOS (${arch}) | Developer ID 签名 + 公证 |"
+                elif grep -q "Signed: 1" "$status_file"; then
+                  echo "| macOS (${arch}) | Developer ID 签名（未公证） |"
+                else
+                  echo "| macOS (${arch}) | 未签名（右键打开或 \`xattr -dr com.apple.quarantine\` 绕过 Gatekeeper） |"
+                fi
+              else
+                echo "| macOS (${arch}) | 未知 |"
+              fi
+            done
+            echo
+            echo "## 已知限制"
+            echo
+            echo "- Windows 安装包未进行代码签名，SmartScreen 可能显示警告，可点击\"仍要运行\"继续。"
+            echo "- macOS 默认为未签名构建，首次启动需右键 -> 打开，或使用 \`xattr -dr com.apple.quarantine /Applications/CompanionAI.app\`。"
+            echo "- Linux 包依赖系统 Python 3.10+，部分功能（OCR、摄像头、神经网络训练）需要额外安装对应依赖。"
+            echo
+            echo "详细变更请查看发布资产中的 CHANGELOG 文件。"
+          } > release-notes.md
+          cat release-notes.md
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -184,4 +279,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "Companion AI $GITHUB_REF_NAME" \
-            --generate-notes
+            --notes-file release-notes.md

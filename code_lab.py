@@ -6,10 +6,11 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
-from _paths import module_root, data_dir
+from _paths import module_root, data_dir, python_exe
 
 
 ROOT = module_root(__file__)
@@ -45,9 +46,60 @@ def _strip_fence(code: str) -> str:
     return code.strip()
 
 
+def _python_runner_command() -> list[str]:
+    """Return a command prefix for a real Python interpreter.
+
+    PyInstaller sets ``sys.executable`` to CompanionAI.exe, which can launch
+    the application but cannot execute an arbitrary ``.py`` learning sample.
+    """
+    if not getattr(sys, "frozen", False):
+        return [sys.executable]
+
+    try:
+        return [python_exe()]
+    except RuntimeError:
+        pass
+
+    candidate = shutil.which("python")
+    if candidate:
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if probe.returncode == 0:
+                return [candidate]
+        except Exception:
+            pass
+
+    py_launcher = shutil.which("py")
+    if py_launcher:
+        try:
+            probe = subprocess.run(
+                [py_launcher, "-3", "-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if probe.returncode == 0:
+                return [py_launcher, "-3"]
+        except Exception:
+            pass
+
+    raise RuntimeError("未检测到可执行 Python 解释器。请安装 Python 3.10 或更高版本后重试。")
+
+
 def _compiler_status() -> dict[str, str]:
+    try:
+        python_runner = " ".join(_python_runner_command())
+    except RuntimeError as exc:
+        python_runner = f"未检测到（{exc}）"
     return {
-        "python": sys.executable,
+        "python": python_runner,
         "gcc": shutil.which("gcc") or "",
         "g++": shutil.which("g++") or "",
         "clang": shutil.which("clang") or "",
@@ -140,9 +192,17 @@ def _run_command(cmd: list[str], cwd: Path, timeout: int, env: dict[str, str] | 
 def _run_python(code: str, run_dir: Path) -> dict[str, Any]:
     source = run_dir / "main.py"
     source.write_text(code, encoding="utf-8")
+    try:
+        command = _python_runner_command()
+    except RuntimeError as exc:
+        return {
+            "compile": {"ok": False, "stdout": "", "stderr": str(exc), "returncode": -1},
+            "run": {"ok": False, "stdout": "", "stderr": "未运行：Python 解释器不可用。", "returncode": -1},
+            "source": source.name,
+        }
     return {
         "compile": {"ok": True, "stdout": "", "stderr": "", "returncode": 0},
-        "run": _run_command([sys.executable, str(source)], run_dir, timeout=8),
+        "run": _run_command([*command, str(source)], run_dir, timeout=8),
         "source": source.name,
     }
 
@@ -173,8 +233,8 @@ def _compile_c_like(language: str, code: str, run_dir: Path) -> dict[str, Any]:
         }
 
     compiler_name = Path(compiler).name.lower()
-    if compiler_name == "cl.exe":
-        cmd = [compiler, "/nologo", str(source), f"/Fe:{exe}"]
+    if compiler_name in {"cl", "cl.exe"}:
+        cmd = [compiler, "/nologo", "/EHsc", str(source), f"/Fe:{exe}"]
     else:
         standard = "-std=c++17" if is_cpp else "-std=c11"
         cmd = [compiler, standard, "-Wall", "-Wextra", str(source), "-o", str(exe)]
@@ -293,7 +353,7 @@ def run_code(language: str, code: str) -> dict[str, Any]:
         return {"ok": False, "error": f"代码太长，最多 {MAX_CODE_CHARS} 字符。"}
 
     _ensure_dirs()
-    run_id = f"run-{int(time.time() * 1000)}"
+    run_id = f"run-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 

@@ -452,10 +452,13 @@
       document.documentElement.style.background = "transparent";
       document.body.style.background = "transparent";
       document.documentElement.style.setProperty("--embed-bg", "rgba(17, 23, 34, 0.01)");
+      document.body.classList.add("shell-mode");
       document.getElementById("controls").style.display = "none";
       var dragHandle = document.getElementById("drag-handle");
       if (dragHandle) dragHandle.style.display = "none";
       if (badge) badge.style.display = "none";
+      var hoverDialog = document.getElementById("hover-dialog");
+      if (hoverDialog) hoverDialog.style.display = "none";
       // 禁用右键菜单
       document.addEventListener("contextmenu", function(e) {
         e.preventDefault();
@@ -658,6 +661,9 @@
       return Math.max(54, Math.min(118, screenHeight * 0.22));
     }
 
+    let modelOffset = { x: 0, y: 0 };
+    let modelDrag = null;
+
     function layoutLive2DModel(model) {
       if (!model || !app) return;
       const sw = app.screen.width;
@@ -674,8 +680,61 @@
       const scale = Math.min(usableWidth / baseWidth, usableHeight / baseHeight) * 0.92;
 
       model.scale.set(scale);
-      model.x = sw / 2;
-      model.y = sh - safeBottom;
+      const renderedWidth = Math.min(sw, Math.max(1, Math.abs(model.width)));
+      const renderedHeight = Math.min(usableHeight, Math.max(1, Math.abs(model.height)));
+      const minX = renderedWidth / 2;
+      const maxX = Math.max(minX, sw - renderedWidth / 2);
+      const minY = renderedHeight;
+      const maxY = Math.max(minY, sh - safeBottom);
+      const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+      const x = clamp(sw / 2 + modelOffset.x, minX, maxX);
+      const y = clamp(sh - safeBottom + modelOffset.y, minY, maxY);
+
+      // Keep the whole model in the available webpage area after every drag or resize.
+      modelOffset.x = x - sw / 2;
+      modelOffset.y = y - (sh - safeBottom);
+      model.x = x;
+      model.y = y;
+      model.interactive = true;
+      model.buttonMode = true;
+      model.cursor = "grab";
+    }
+
+    function bindLive2DDrag(model) {
+      if (!model || !app) return;
+      model.interactive = true;
+      model.buttonMode = true;
+      model.cursor = "grab";
+      model.removeAllListeners("pointerdown");
+      model.removeAllListeners("pointerup");
+      model.removeAllListeners("pointerupoutside");
+      model.removeAllListeners("pointermove");
+      model.on("pointerdown", (e) => {
+        const p = e.data.global;
+        modelDrag = {
+          startX: p.x,
+          startY: p.y,
+          originX: modelOffset.x,
+          originY: modelOffset.y,
+        };
+        model.cursor = "grabbing";
+        e.stopPropagation();
+      });
+      model.on("pointerup", () => {
+        modelDrag = null;
+        model.cursor = "grab";
+      });
+      model.on("pointerupoutside", () => {
+        modelDrag = null;
+        model.cursor = "grab";
+      });
+      model.on("pointermove", (e) => {
+        if (!modelDrag) return;
+        const p = e.data.global;
+        modelOffset.x = modelDrag.originX + (p.x - modelDrag.startX);
+        modelOffset.y = modelDrag.originY + (p.y - modelDrag.startY);
+        layoutLive2DModel(model);
+      });
     }
 
     // -- check CDN scripts --
@@ -754,9 +813,11 @@
         }
 
         layoutLive2DModel(model);
+        bindLive2DDrag(model);
 
         app.stage.interactive = true;
         app.stage.on("pointermove", (e) => {
+          if (modelDrag) return;
           model.focus(e.data.global.x, e.data.global.y);
         });
 
@@ -767,8 +828,7 @@
         logError('模型加载成功', modelPath);
 
         if (embedMode) {
-          showBadge("" + modelPath.split("/").pop(), "success");
-          setTimeout(hideBadge, 3000);
+          // embed 预览不显示状态提示
         }
 
         if (triggerMotion) {
@@ -811,8 +871,8 @@
         const pageX = cursor.x - windowBounds.x;
         const pageY = cursor.y - windowBounds.y;
         const stageX = (pageX - rect.left) * (app.screen.width / rect.width);
-        const rawStageY = app.screen.height - (pageY - rect.top) * (app.screen.height / rect.height);
-        const stageY = app.screen.height / 2 + (rawStageY - app.screen.height / 2) * 2.2;
+        // Match the stage's local pointer coordinates: Y grows toward the bottom.
+        const stageY = (pageY - rect.top) * (app.screen.height / rect.height);
         try { currentModel.focus(stageX, stageY); } catch (_error) {}
         return;
       }
@@ -841,6 +901,7 @@
     let dialogVisible = false;
 
     function showDialog() {
+      if (embedMode || shellMode) return;
       if (dialogVisible) return;
       dialogVisible = true;
       dialog.classList.add("visible");

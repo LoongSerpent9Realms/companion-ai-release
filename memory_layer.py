@@ -34,6 +34,10 @@ SENSITIVE_HINTS = (
 )
 _STOPWORDS = {"的", "了", "和", "是", "我", "你", "在", "有", "就", "也", "都", "很", "the", "a", "an", "is", "are", "to", "of", "and", "or", "in", "on"}
 
+EBBINGHAUS_HALF_LIFE = 14 * 86400
+EBBINGHAUS_FORGET_THRESHOLD = 0.05
+EBBINGHAUS_MIN_CONFIDENCE = 0.1
+
 
 def _default_store() -> dict[str, Any]:
     return {"schema_version": 2, "profile": [], "preferences": [], "facts": []}
@@ -282,3 +286,116 @@ class MemoryStore:
                 source = SOURCE_LABELS.get(str(item.get("source")), "本地记录")
                 lines.append(f"- {item.get('text', '')}（{source}）")
         return "\n".join(lines)
+
+    def apply_forgetting_decay(self) -> int:
+        store = self.load()
+        now = int(time.time())
+        changed = False
+        forgotten_count = 0
+
+        for bucket in BUCKETS:
+            for item in store.get(bucket, []):
+                if item.get("status") != "active":
+                    continue
+                if item.get("sensitive"):
+                    continue
+
+                last_touch = max(
+                    int(item.get("updated_at", 0)),
+                    int(item.get("created_at", 0)),
+                )
+                age = now - last_touch
+                if age < 86400:
+                    continue
+
+                decay = 0.5 ** (age / EBBINGHAUS_HALF_LIFE)
+                current_conf = float(item.get("confidence", 0.5))
+                new_conf = round(current_conf * decay, 4)
+
+                if new_conf != current_conf:
+                    item["confidence"] = max(EBBINGHAUS_MIN_CONFIDENCE, new_conf)
+                    item["updated_at"] = now
+                    changed = True
+
+                if new_conf < EBBINGHAUS_FORGET_THRESHOLD:
+                    item["status"] = "forgotten"
+                    item["updated_at"] = now
+                    forgotten_count += 1
+                    changed = True
+
+        if changed:
+            self.save(store)
+        return forgotten_count
+
+    def touch_memory(self, record_id: str) -> bool:
+        store = self.load()
+        now = int(time.time())
+        found = False
+
+        for bucket in BUCKETS:
+            for item in store.get(bucket, []):
+                if item.get("id") == record_id:
+                    item["updated_at"] = now
+                    item["status"] = "active"
+                    current_conf = float(item.get("confidence", 0.5))
+                    item["confidence"] = min(1.0, current_conf + 0.1)
+                    found = True
+                    break
+            if found:
+                break
+
+        if found:
+            self.save(store)
+        return found
+
+    def get_memory_health(self) -> dict[str, Any]:
+        store = self.load()
+        now = int(time.time())
+        stats = {
+            "total": 0,
+            "active": 0,
+            "forgotten": 0,
+            "superseded": 0,
+            "avg_confidence": 0.0,
+            "oldest_days": 0,
+            "youngest_days": 0,
+            "buckets": {},
+        }
+        total_confidence = 0.0
+        oldest_time = now
+        youngest_time = 0
+
+        for bucket in BUCKETS:
+            bucket_stats = {"total": 0, "active": 0, "forgotten": 0, "superseded": 0}
+            for item in store.get(bucket, []):
+                stats["total"] += 1
+                bucket_stats["total"] += 1
+
+                status = item.get("status", "active")
+                if status == "active":
+                    stats["active"] += 1
+                    bucket_stats["active"] += 1
+                    total_confidence += float(item.get("confidence", 0.5))
+                elif status == "forgotten":
+                    stats["forgotten"] += 1
+                    bucket_stats["forgotten"] += 1
+                elif status == "superseded":
+                    stats["superseded"] += 1
+                    bucket_stats["superseded"] += 1
+
+                created = int(item.get("created_at", 0))
+                if created and created < oldest_time:
+                    oldest_time = created
+                if created and created > youngest_time:
+                    youngest_time = created
+
+            stats["buckets"][bucket] = bucket_stats
+
+        if stats["active"] > 0:
+            stats["avg_confidence"] = round(total_confidence / stats["active"], 4)
+        if oldest_time < now:
+            stats["oldest_days"] = round((now - oldest_time) / 86400, 1)
+        if youngest_time > 0:
+            stats["youngest_days"] = round((now - youngest_time) / 86400, 1)
+
+        return stats

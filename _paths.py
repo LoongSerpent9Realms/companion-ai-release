@@ -9,6 +9,7 @@ this helper to resolve their ROOT consistently.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -173,6 +174,7 @@ def python_exe() -> str:
         current = accept(sys.executable)
         if current:
             return current
+        # Current Python not usable, continue searching for a supported version
 
     # 1) py launcher (ships with official Python Windows installer)
     py = shutil.which("py")
@@ -391,6 +393,57 @@ def runtime_python_exe(root: Path | None = None, create: bool = True) -> str:
         detail = (pip_result.stderr or pip_result.stdout or "pip 不可用").strip()
         raise RuntimeError(f"组件虚拟环境 pip 不可用：{detail}")
     return str(venv_python)
+
+
+def runtime_subprocess_env(python: str | None = None) -> dict[str, str]:
+    """Return an isolated environment for component-runtime subprocesses.
+
+    Native wheels are linked to a specific CPython DLL.  A launcher started
+    from another Python installation can leak its ``PYTHONPATH`` or DLL
+    directories into the component runtime and make it load incompatible
+    extensions.  Keep the child process on its own venv and base interpreter.
+    """
+    env = os.environ.copy()
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONPATH", None)
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONSAFEPATH"] = "1"
+
+    try:
+        runtime = Path(python or runtime_python_exe(create=False)).resolve()
+        script_dir = runtime.parent
+        venv_dir = script_dir.parent if os.name == "nt" else script_dir.parent.parent
+        base_dir = None
+        config = venv_dir / "pyvenv.cfg"
+        if config.is_file():
+            for line in config.read_text(encoding="utf-8", errors="ignore").splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key.strip().lower() == "home" and value.strip():
+                    base_dir = Path(value.strip()).resolve()
+                    break
+
+        runtime_dirs = [script_dir]
+        if base_dir is not None:
+            runtime_dirs.extend([base_dir, base_dir / "DLLs"])
+        runtime_texts = {str(path).casefold() for path in runtime_dirs}
+        inherited = []
+        for entry in env.get("PATH", "").split(os.pathsep):
+            normalized = entry.strip()
+            if not normalized:
+                continue
+            if normalized.casefold() in runtime_texts:
+                continue
+            # Do not allow a different CPython installation to supply DLLs.
+            if re.search(r"(?i)(?:^|[\\/])python3\d{2}(?:[\\/]|$)", normalized):
+                continue
+            inherited.append(normalized)
+        env["PATH"] = os.pathsep.join([*(str(path) for path in runtime_dirs), *inherited])
+    except Exception:
+        # Environment sanitization is still useful even if runtime discovery
+        # fails; callers will report the original runtime error separately.
+        pass
+
+    return env
 
 
 def external_site_packages() -> list[Path]:

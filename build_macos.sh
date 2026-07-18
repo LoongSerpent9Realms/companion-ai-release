@@ -57,7 +57,7 @@ HIDDEN_IMPORTS=(
   hybrid_chat retrieval_chat tiny_llm embedding_retrieval emotion_diary
   dataset_loader plugin_manager rapidocr_runner face_manager neural_companion
   llm_inference llm_trainer operation_learning procedural_rules conversation_audit
-  audit_training train_llm _paths app desktop_pet pystray PIL certifi
+  audit_training train_llm code_lab algorithm_curriculum toolchain_manager _paths app desktop_pet pystray PIL certifi
 )
 EXCLUDED_MODULES=(
   torch torchvision torchaudio torch_directml triton pytorch_triton cv2 edge_tts
@@ -89,6 +89,31 @@ if [[ ! -x "$APP_DIR/Contents/MacOS/$APP_NAME" ]]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Optional Developer ID code signing.
+# Activated when MAC_DEVELOPER_IDENTITY is set (e.g. "Developer ID Application: Name (TEAMID)").
+# Without it the build produces an unsigned app, which macOS Gatekeeper will
+# warn about. Distributors should set these secrets in CI.
+# ---------------------------------------------------------------------------
+SIGNED=0
+if [[ -n "${MAC_DEVELOPER_IDENTITY:-}" ]]; then
+  echo "[macos-build] Signing $APP_DIR with '$MAC_DEVELOPER_IDENTITY'..."
+  # Sign embedded frameworks/helpers first (deepest), then the app itself.
+  find "$APP_DIR" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +111 \) -print0 | while IFS= read -r -d '' bin; do
+    codesign --force --options runtime --sign "$MAC_DEVELOPER_IDENTITY" --timestamp "$bin" 2>/dev/null || true
+  done
+  codesign --deep --force --options runtime --sign "$MAC_DEVELOPER_IDENTITY" --timestamp "$APP_DIR"
+  # Verify the signature.
+  if codesign --verify --strict --verbose=2 "$APP_DIR" 2>&1 | grep -q "valid on disk"; then
+    SIGNED=1
+    echo "[macos-build] Code signature verified."
+  else
+    echo "[macos-build] WARNING: codesign verification failed; continuing unsigned." >&2
+  fi
+else
+  echo "[macos-build] MAC_DEVELOPER_IDENTITY not set; skipping code signing (unsigned build)."
+fi
+
 STAGE="$BUILD_ROOT/$PACKAGE_NAME"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
@@ -98,4 +123,45 @@ DMG_PATH="$DIST_ROOT/$PACKAGE_NAME.dmg"
 rm -f "$DMG_PATH"
 hdiutil create -volname "Companion AI ${VERSION}" -srcfolder "$STAGE" -ov -format UDZO "$DMG_PATH"
 
+# ---------------------------------------------------------------------------
+# Optional notarization + stapling.
+# Activated when MAC_APPLE_ID, MAC_APP_SPECIFIC_PASSWORD and MAC_TEAM_ID are
+# set. Uses Apple's notarytool to submit the DMG, waits for the result, then
+# staples the ticket so offline Gatekeeper checks pass.
+# ---------------------------------------------------------------------------
+NOTARIZED=0
+if [[ "$SIGNED" -eq 1 && -n "${MAC_APPLE_ID:-}" && -n "${MAC_APP_SPECIFIC_PASSWORD:-}" && -n "${MAC_TEAM_ID:-}" ]]; then
+  echo "[macos-build] Submitting $DMG_PATH for notarization..."
+  SUBMIT_LOG="$BUILD_ROOT/notarize_submit.log"
+  if xcrun notarytool submit "$DMG_PATH" \
+      --apple-id "$MAC_APPLE_ID" \
+      --password "$MAC_APP_SPECIFIC_PASSWORD" \
+      --team-id "$MAC_TEAM_ID" \
+      --wait --timeout 30m > "$SUBMIT_LOG" 2>&1; then
+    if grep -q "status: Accepted" "$SUBMIT_LOG"; then
+      echo "[macos-build] Notarization accepted; stapling..."
+      if xcrun stapler staple "$DMG_PATH"; then
+        NOTARIZED=1
+        echo "[macos-build] Stapling complete."
+      else
+        echo "[macos-build] WARNING: stapler failed; DMG is notarized but not stapled." >&2
+      fi
+    else
+      echo "[macos-build] WARNING: notarization did not return Accepted status." >&2
+      cat "$SUBMIT_LOG" >&2
+    fi
+  else
+    echo "[macos-build] WARNING: notarytool submission failed." >&2
+    cat "$SUBMIT_LOG" >&2
+  fi
+else
+  echo "[macos-build] Notarization credentials not set; skipping notarization."
+fi
+
 echo "[macos-build] Created: $DMG_PATH"
+echo "[macos-build] Signed: $SIGNED | Notarized: $NOTARIZED"
+if [[ "$SIGNED" -eq 0 ]]; then
+  echo "[macos-build] NOTE: This is an UNSIGNED build. macOS Gatekeeper will show a warning."
+  echo "[macos-build]       End users can right-click -> Open to bypass, or run:"
+  echo "[macos-build]       xattr -dr com.apple.quarantine /Applications/CompanionAI.app"
+fi

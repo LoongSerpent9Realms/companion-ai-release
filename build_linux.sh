@@ -57,7 +57,7 @@ HIDDEN_IMPORTS=(
   hybrid_chat retrieval_chat tiny_llm embedding_retrieval emotion_diary
   dataset_loader plugin_manager rapidocr_runner face_manager neural_companion
   llm_inference llm_trainer operation_learning procedural_rules conversation_audit
-  audit_training train_llm _paths app desktop_pet pystray PIL certifi
+  audit_training train_llm code_lab algorithm_curriculum toolchain_manager _paths app desktop_pet pystray PIL certifi
 )
 EXCLUDED_MODULES=(
   torch torchvision torchaudio torch_directml triton pytorch_triton cv2 edge_tts

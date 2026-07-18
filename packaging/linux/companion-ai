@@ -1,5 +1,48 @@
 #!/usr/bin/env sh
 set -eu
 
-APP_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/../opt/companion-ai" && pwd)"
+# Resolve the Companion AI application directory across the three supported
+# Linux install layouts:
+#   1. System install (.deb): launcher at /usr/bin/companion-ai, app at /opt/companion-ai
+#   2. User install (install-user.sh): launcher at $PREFIX/bin/companion-ai, app at $PREFIX/opt/companion-ai
+#   3. Tarball direct run: launcher at <pkg>/usr/bin/companion-ai, app at <pkg>/opt/companion-ai
+# The previous script only handled cases 1 and 2 via a single "../opt/companion-ai"
+# relative path, which broke when the launcher was executed in place from the
+# extracted tarball (it resolved to <pkg>/usr/opt/companion-ai instead of
+# <pkg>/opt/companion-ai).
+
+_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+_find_app_dir() {
+    # Case 1 & 2: sibling of the launcher's bin/ directory -> ../opt/companion-ai
+    candidate="$_script_dir/../opt/companion-ai"
+    if [ -x "$candidate/CompanionAI" ]; then
+        printf '%s' "$(CDPATH= cd -- "$candidate" && pwd)"
+        return 0
+    fi
+    # Case 3: tarball layout <pkg>/usr/bin -> <pkg>/opt/companion-ai
+    if [ "$(basename -- "$_script_dir")" = "bin" ] && [ "$(basename -- "$(dirname -- "$_script_dir")")" = "usr" ]; then
+        candidate="$(dirname -- "$_script_dir")/../opt/companion-ai"
+        if [ -x "$candidate/CompanionAI" ]; then
+            printf '%s' "$(CDPATH= cd -- "$candidate" && pwd)"
+            return 0
+        fi
+    fi
+    # Fallback: app lives alongside the launcher (portable extraction)
+    if [ -x "$_script_dir/CompanionAI" ]; then
+        printf '%s' "$_script_dir"
+        return 0
+    fi
+    return 1
+}
+
+APP_DIR="$(_find_app_dir)" || {
+    echo "companion-ai: unable to locate CompanionAI executable relative to '$_script_dir'" >&2
+    echo "Expected one of:" >&2
+    echo "  $_script_dir/../opt/companion-ai/CompanionAI" >&2
+    echo "  $(dirname -- "$_script_dir")/../opt/companion-ai/CompanionAI" >&2
+    echo "  $_script_dir/CompanionAI" >&2
+    exit 1
+}
+
 exec "$APP_DIR/CompanionAI" "$@"

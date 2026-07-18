@@ -172,6 +172,23 @@ def profile_context(limit_per_bucket: int = 3) -> str:
     return "已知用户画像（仅来自本地聊天推断，可用 /profile 管理）：\n" + "\n".join(parts)
 
 
+def set_user_address(name: str) -> str:
+    """Directly set the user's preferred address in the identity bucket."""
+    profile = load_user_profile()
+    buckets = profile.setdefault("buckets", {})
+    entries = buckets.setdefault("identity", [])
+    now = int(time.time())
+    # Remove any existing address entries that look like names
+    entries[:] = [
+        e for e in entries
+        if not any(kw in e.get("text", "") for kw in ["我叫", "叫我", "我的名字是", "我是"])
+    ]
+    entries.append({"time": now, "text": f"叫我{name}", "source": "user_command", "confidence": 1.0})
+    profile["updated_at"] = now
+    save_user_profile(profile)
+    return name
+
+
 def handle_profile_command(message: str) -> str | None:
     if message == "/profile":
         return profile_summary()
@@ -184,4 +201,49 @@ def handle_profile_command(message: str) -> str | None:
     if message == "/profile_clear":
         clear_user_profile()
         return "已清空用户画像。"
+    if message.startswith("/name "):
+        name = message[6:].strip()
+        if not name or len(name) > 20:
+            return "请提供一个有效的称呼（1-20个字符）。例如：/name 主人"
+        set_user_address(name)
+        return f"已设置称呼为「{name}」，之后我会用这个称呼来叫你。"
     return None
+
+
+def get_user_preferred_address() -> str | None:
+    """Extract how the user prefers to be called from identity bucket.
+
+    Returns the most recent identity text (e.g., "叫我小明", "我叫李华"),
+    stripped to just the name part, or None if not set.
+    """
+    profile = load_user_profile()
+    if not profile.get("enabled", True):
+        return None
+    identity_items = profile.get("buckets", {}).get("identity", [])
+    if not identity_items:
+        return None
+    # Take the most recent identity item
+    latest = identity_items[-1] if identity_items else None
+    if not latest:
+        return None
+    text = latest.get("text", "")
+    # Extract name from patterns like "我叫X", "叫我X", "我的名字是X"
+    patterns = [
+        r"(?:我叫|叫我|我的名字是|我是)\s*([^\s，。；,.\!！？?]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            name = match.group(1).strip()
+            if name and len(name) <= 20:
+                return name
+    return None
+
+
+def get_ai_address_to_user() -> str:
+    """Return the address prefix AI should use for the user.
+
+    Examples: "小明", "李华", or empty string if not set.
+    """
+    name = get_user_preferred_address()
+    return name or ""

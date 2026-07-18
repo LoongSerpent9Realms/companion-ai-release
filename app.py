@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import atexit
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -54,6 +55,7 @@ def ensure_optional_site_packages() -> None:
         return
     ensure_external_site_packages()
     _external_site_packages_ready = True
+
 
 from neural_companion import (
     gpu_self_check_isolated,
@@ -187,6 +189,7 @@ if __name__ == "__main__":
 MEMORY_FILE = DATA_DIR / "memory.json"
 MEMORY_STORE = MemoryStore(MEMORY_FILE)
 HISTORY_FILE = DATA_DIR / "history.jsonl"
+RECENT_CHATS_FILE = DATA_DIR / "recent_chats.json"
 TRAINING_FILE = DATA_DIR / "training.json"
 FILES_FILE = DATA_DIR / "files.json"
 MOMENTS_FILE = DATA_DIR / "moments.json"
@@ -205,13 +208,18 @@ MODEL_DIR = DATA_DIR / "models"
 ALLOW_LAN = os.environ.get("COMPANION_ALLOW_LAN", "").strip().lower() in {"1", "true", "yes", "on"}
 HOST = os.environ.get("COMPANION_HOST", "0.0.0.0" if ALLOW_LAN else "127.0.0.1")
 PORT = int(os.environ.get("COMPANION_PORT", "59137"))
+OFFICIAL_UPDATE_RELEASE_REPO = "LoongSerpent9Realms/companion-ai-release"
+OFFICIAL_UPDATE_RELEASE_PAGE = f"https://github.com/{OFFICIAL_UPDATE_RELEASE_REPO}/releases"
 DEFAULT_UPDATE_MANIFEST_URL = os.environ.get(
     "COMPANION_UPDATE_MANIFEST_URL",
-    "https://api.github.com/repos/LoongSerpent9Realms/companion-ai-release/releases/latest",
+    f"https://api.github.com/repos/{OFFICIAL_UPDATE_RELEASE_REPO}/releases/latest",
 )
 LEGACY_UPDATE_MANIFEST_URLS = {
     "",
     "https://example.com/companion-ai/update.json",
+    # older placeholder / wrong hosts that must never be used for checks
+    "https://example.invalid/manifest.json",
+    "https://api.github.com/repos/example/companion-ai/releases/latest",
 }
 
 
@@ -358,6 +366,11 @@ I18N_MESSAGES = {
         "chinese": "中文",
         "english": "English",
         "memory_title": "长期记忆",
+        "chat_workspace": "对话",
+        "function_area": "功能区",
+        "context_title": "长期记忆与上下文",
+        "composer_tools": "附件、网页与更多",
+        "realtime_options": "实时对话选项",
         "memory_loading": "加载中...",
         "training_loading": "训练样本：加载中...",
         "files_empty": "文件：暂无",
@@ -502,6 +515,11 @@ I18N_MESSAGES = {
         "chinese": "中文",
         "english": "English",
         "memory_title": "Long-Term Memory",
+        "chat_workspace": "Chat",
+        "function_area": "Features",
+        "context_title": "Memory & Context",
+        "composer_tools": "Files, web & more",
+        "realtime_options": "Realtime options",
         "memory_loading": "Loading...",
         "training_loading": "Training samples: loading...",
         "files_empty": "Files: none",
@@ -664,8 +682,8 @@ DISPLAY_DEFAULTS = {
     "font_scale": 100,
     "density": 100,
     "radius": 8,
-    "sidebar_width": 320,
-    "avatar_height": 170,
+    "sidebar_width": 280,
+    "avatar_height": 84,
     "custom": dict(DISPLAY_CUSTOM_DEFAULTS),
 }
 
@@ -680,7 +698,7 @@ def normalize_display_config(value: dict | None = None) -> dict:
         ("density", 80, 125),
         ("radius", 2, 18),
         ("sidebar_width", 240, 440),
-        ("avatar_height", 130, 260),
+        ("avatar_height", 64, 104),
     ):
         try:
             config[key] = max(low, min(high, int(raw.get(key, config[key]))))
@@ -802,16 +820,18 @@ def load_update_state() -> dict:
     state = default_update_state()
     if isinstance(data, dict):
         state.update({k: v for k, v in data.items() if k in state})
-    if str(state.get("manifest_url") or "").strip() in LEGACY_UPDATE_MANIFEST_URLS:
-        state["manifest_url"] = DEFAULT_UPDATE_MANIFEST_URL
+    # Update metadata must always come from the official release endpoint.
+    # Never trust an endpoint persisted by an older client or sent by a user.
+    state["manifest_url"] = DEFAULT_UPDATE_MANIFEST_URL
     return state
 
 
 def save_update_state(partial: dict) -> dict:
     state = load_update_state()
-    for key in ("manifest_url", "auto_check", "auto_download", "auto_install", "check_interval_hours", "last_check", "last_error", "latest", "downloaded"):
+    for key in ("auto_check", "auto_download", "auto_install", "check_interval_hours", "last_check", "last_error", "latest", "downloaded"):
         if key in partial:
             state[key] = partial[key]
+    state["manifest_url"] = DEFAULT_UPDATE_MANIFEST_URL
     state["auto_check"] = bool(state.get("auto_check"))
     state["auto_download"] = bool(state.get("auto_download"))
     state["auto_install"] = bool(state.get("auto_install"))
@@ -831,6 +851,8 @@ def update_public_state() -> dict:
     return {
         "current_version": current_app_version(),
         "manifest_url": state.get("manifest_url", ""),
+        "release_repo": OFFICIAL_UPDATE_RELEASE_REPO,
+        "release_page": OFFICIAL_UPDATE_RELEASE_PAGE,
         "auto_check": bool(state.get("auto_check")),
         "auto_download": bool(state.get("auto_download")),
         "auto_install": bool(state.get("auto_install")),
@@ -886,36 +908,290 @@ def _github_release_manifest(data: dict) -> dict:
 
 
 _HTTPS_SSL_CONTEXT = None
+_HTTPS_SSL_CONTEXT_CANDIDATES: list[ssl.SSLContext] | None = None
+
+
+def _windows_system_ssl_context() -> ssl.SSLContext | None:
+    """Build an SSL context that trusts the Windows certificate stores."""
+    if not sys.platform.startswith("win") or not hasattr(ssl, "enum_certificates"):
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        try:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        except Exception:
+            pass
+        loaded = 0
+        for store_name in ("CA", "ROOT"):
+            try:
+                for cert, encoding, _trust in ssl.enum_certificates(store_name):
+                    if encoding != "x509_asn":
+                        continue
+                    try:
+                        ctx.load_verify_locations(cadata=cert)
+                        loaded += 1
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return ctx if loaded else None
+    except Exception:
+        return None
+
+
+def https_ssl_contexts() -> list[ssl.SSLContext]:
+    """Ordered SSL contexts: Windows store, certifi, then Python defaults."""
+    global _HTTPS_SSL_CONTEXT_CANDIDATES, _HTTPS_SSL_CONTEXT
+    if _HTTPS_SSL_CONTEXT_CANDIDATES is not None:
+        return _HTTPS_SSL_CONTEXT_CANDIDATES
+    contexts: list[ssl.SSLContext] = []
+    win_ctx = _windows_system_ssl_context()
+    if win_ctx is not None:
+        contexts.append(win_ctx)
+    try:
+        import certifi
+        contexts.append(ssl.create_default_context(cafile=certifi.where()))
+    except Exception:
+        pass
+    contexts.append(ssl.create_default_context())
+    unique: list[ssl.SSLContext] = []
+    for ctx in contexts:
+        if ctx not in unique:
+            unique.append(ctx)
+    _HTTPS_SSL_CONTEXT_CANDIDATES = unique
+    _HTTPS_SSL_CONTEXT = unique[0]
+    return unique
 
 
 def https_ssl_context() -> ssl.SSLContext:
-    """Use bundled certifi CA roots when available, then fall back to Python defaults."""
-    global _HTTPS_SSL_CONTEXT
-    if _HTTPS_SSL_CONTEXT is not None:
-        return _HTTPS_SSL_CONTEXT
+    """Primary HTTPS SSL context used by open_url()."""
+    return https_ssl_contexts()[0]
+
+
+def _is_proxy_or_tls_failure(exc: BaseException) -> bool:
+    """True when a local MITM proxy or TLS trust failure likely blocked the request."""
+    text = str(exc or "").lower()
+    markers = (
+        "certificate verify failed",
+        "certificate_verify_failed",
+        "ssl:",
+        "tls",
+        "devsidecar",
+        "err_tls_cert_altname_invalid",
+        "hostname/ip does not match",
+        "proxy",
+        "tunnel connection failed",
+        "cannot connect to proxy",
+        "timed out",
+        "timeout",
+        "10054",
+        "10061",
+        "connection reset",
+        "connection refused",
+        "remote end closed connection",
+        "unexpected_eof",
+        "wrong version number",
+        "internal server error",
+    )
+    if any(marker in text for marker in markers):
+        return True
+    if isinstance(exc, urllib.error.HTTPError) and int(getattr(exc, "code", 0) or 0) >= 500:
+        return True
+    return isinstance(exc, (ssl.SSLError, TimeoutError, ConnectionError, socket.timeout, socket.gaierror))
+
+
+def _request_headers(req_or_url) -> dict[str, str]:
+    if isinstance(req_or_url, urllib.request.Request):
+        return {str(k): str(v) for k, v in req_or_url.header_items()}
+    return {}
+
+
+def _request_url(req_or_url) -> str:
+    if isinstance(req_or_url, urllib.request.Request):
+        return req_or_url.full_url
+    return str(req_or_url)
+
+
+def _is_github_host(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return host in {"github.com", "api.github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"} or host.endswith(".github.com") or host.endswith(".githubusercontent.com")
+
+
+def _proxy_attempt_order(url: str) -> list[dict | None]:
+    """Prefer direct access for GitHub when a local MITM proxy is present."""
+    proxies = {}
     try:
-        import certifi
-        _HTTPS_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+        proxies = urllib.request.getproxies() or {}
     except Exception:
-        _HTTPS_SSL_CONTEXT = ssl.create_default_context()
-    return _HTTPS_SSL_CONTEXT
+        proxies = {}
+    proxy_values = " ".join(str(v) for v in proxies.values()).lower()
+    local_mitm = any(token in proxy_values for token in ("127.0.0.1", "localhost", "::1"))
+    if _is_github_host(url) or local_mitm:
+        return [{}, None]
+    return [None, {}]
+
+
+def _open_url_with_urllib(req: urllib.request.Request, *, timeout: int) -> object:
+    contexts = https_ssl_contexts()
+    errors: list[str] = []
+    for proxy_map in _proxy_attempt_order(req.full_url):
+        for ctx in contexts:
+            label = "direct" if proxy_map == {} else "system"
+            try:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler(proxy_map if proxy_map is not None else urllib.request.getproxies()),
+                    urllib.request.HTTPSHandler(context=ctx),
+                )
+                return opener.open(req, timeout=timeout)
+            except Exception as exc:
+                errors.append(f"proxy={label}: {exc}")
+                continue
+    raise RuntimeError("HTTPS urllib 失败：" + " | ".join(errors[-6:]) if errors else "HTTPS urllib 失败")
+
+
+def _powershell_fetch_bytes(url: str, headers: dict[str, str] | None = None, *, timeout: int = 20) -> bytes:
+    """Fetch URL bytes via PowerShell, which uses the Windows TLS stack."""
+    if not sys.platform.startswith("win"):
+        raise RuntimeError("PowerShell fallback only available on Windows")
+    headers = headers or {}
+    ps_headers = "; ".join(
+        f"$h[{json.dumps(str(k))}] = {json.dumps(str(v))}" for k, v in headers.items()
+    )
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$h = @{{}}
+{ps_headers}
+$resp = Invoke-WebRequest -Uri {json.dumps(url)} -Headers $h -UseBasicParsing -TimeoutSec {max(5, int(timeout))}
+[Console]::Out.Write([Convert]::ToBase64String($resp.Content))
+"""
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=max(10, int(timeout) + 10),
+        creationflags=CREATE_NO_WINDOW,
+    )
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or "PowerShell fetch failed").strip()
+        raise RuntimeError(err)
+    import base64
+    payload = (completed.stdout or "").strip()
+    if not payload:
+        raise RuntimeError("PowerShell fetch returned empty body")
+    return base64.b64decode(payload)
+
+
+def _curl_fetch_bytes(url: str, headers: dict[str, str] | None = None, *, timeout: int = 20) -> bytes:
+    """Fetch URL bytes via curl.exe when available."""
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        raise RuntimeError("curl not found")
+    cmd = [curl, "-fsSL", "--max-time", str(max(5, int(timeout))), url]
+    for key, value in (headers or {}).items():
+        cmd.extend(["-H", f"{key}: {value}"])
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        timeout=max(10, int(timeout) + 10),
+        creationflags=CREATE_NO_WINDOW,
+    )
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or b"curl failed").decode("utf-8", "replace").strip()
+        raise RuntimeError(err or f"curl exit {completed.returncode}")
+    return completed.stdout
+
+
+class _BytesHTTPResponse:
+    """Minimal file-like response used by native Windows fetch fallbacks."""
+
+    def __init__(self, data: bytes, url: str = "", status: int = 200):
+        self._data = data or b""
+        self._offset = 0
+        self.url = url
+        self.status = status
+        self.headers = {}
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            chunk = self._data[self._offset :]
+            self._offset = len(self._data)
+            return chunk
+        chunk = self._data[self._offset : self._offset + n]
+        self._offset += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
 
 
 def open_url(req_or_url, *, timeout: int = 20):
+    """Open an HTTP(S) URL with resilient SSL, proxy, and Windows-native fallbacks.
+
+    Local MITM proxies such as DevSidecar can break GitHub TLS for Python's
+    urllib even when PowerShell/curl succeed. Prefer direct no-proxy for GitHub,
+    then system proxy, then native Windows fetchers.
+    """
     if isinstance(req_or_url, urllib.request.Request):
-        url = req_or_url.full_url
+        req = req_or_url
+        url = req.full_url
     else:
         url = str(req_or_url)
+        req = urllib.request.Request(url)
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme == "https":
-        return urllib.request.urlopen(req_or_url, timeout=timeout, context=https_ssl_context())
-    return urllib.request.urlopen(req_or_url, timeout=timeout)
+    if parsed.scheme != "https":
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    headers = _request_headers(req)
+    errors: list[str] = []
+
+    try:
+        return _open_url_with_urllib(req, timeout=timeout)
+    except Exception as exc:
+        errors.append(f"urllib: {exc}")
+
+    # Native Windows stacks often still work under MITM/proxy environments.
+    for name, fetcher in (
+        ("powershell", _powershell_fetch_bytes),
+        ("curl", _curl_fetch_bytes),
+    ):
+        try:
+            data = fetcher(url, headers, timeout=timeout)
+            return _BytesHTTPResponse(data, url=url)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+
+    raise RuntimeError("HTTPS 请求失败：" + " | ".join(errors[-6:]) if errors else "HTTPS 请求失败")
 
 
 def fetch_update_manifest(url: str) -> dict:
     if str(url or "").strip() in LEGACY_UPDATE_MANIFEST_URLS:
         url = DEFAULT_UPDATE_MANIFEST_URL
-    req = urllib.request.Request(url, headers={"User-Agent": f"CompanionAI/{current_app_version()}"})
+    # Always prefer the fixed official endpoint unless an explicit env override is set.
+    if not os.environ.get("COMPANION_UPDATE_MANIFEST_URL"):
+        url = DEFAULT_UPDATE_MANIFEST_URL
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": f"CompanionAI/{current_app_version()}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
     with open_url(req, timeout=20) as resp:
         raw = resp.read(2_000_000)
     data = json.loads(raw.decode("utf-8"))
@@ -1050,6 +1326,40 @@ def ensure_data() -> None:
     face_manager.init_face_manager(DATA_DIR)
 
 
+LAN_TOKEN_FILE = DATA_DIR / "lan_token.json"
+
+
+def lan_access_token(*, regenerate: bool = False) -> str:
+    """Return the LAN access token, creating it on first use.
+
+    The token gates write (POST) requests coming from non-loopback addresses
+    when LAN mode is enabled. Local (127.0.0.1) requests are always exempt.
+    """
+    import secrets
+
+    if not regenerate:
+        try:
+            data = json.loads(LAN_TOKEN_FILE.read_text(encoding="utf-8"))
+            token = str(data.get("token") or "").strip()
+            if token:
+                return token
+        except Exception:
+            pass
+    token = secrets.token_urlsafe(32)
+    LAN_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LAN_TOKEN_FILE.write_text(json.dumps({"token": token, "created_at": datetime.now().astimezone().isoformat(timespec="seconds")}), encoding="utf-8")
+    return token
+
+
+def _is_loopback_client(client_address) -> bool:
+    """Return True if the request originates from the local machine."""
+    try:
+        host = (client_address or ("",))[0]
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "::1", "localhost", ""}
+
+
 def local_ip_addresses() -> list[str]:
     ips: set[str] = set()
     try:
@@ -1071,11 +1381,11 @@ def local_ip_addresses() -> list[str]:
     return sorted(ips)
 
 
-def local_access_info() -> dict:
+def local_access_info(*, loopback: bool = False) -> dict:
     lan_ips = local_ip_addresses()
     lan_urls = [f"http://{ip}:{PORT}" for ip in lan_ips]
     public_host = "127.0.0.1" if HOST in {"", "0.0.0.0", "::"} else HOST
-    return {
+    info = {
         "mode": "lan" if ALLOW_LAN or HOST in {"0.0.0.0", "::"} else "local",
         "host": HOST,
         "port": PORT,
@@ -1092,6 +1402,80 @@ def local_access_info() -> dict:
             "training_location": "local_device",
             "cloud_role": "website_updates_pairing_only",
             "uploads_required": False,
+        },
+    }
+    # Only reveal the LAN pairing token to loopback callers (the local console).
+    # Non-local callers get the access info without the token, so a LAN peer
+    # cannot read the token from /api/local_access without already pairing.
+    if loopback and (ALLOW_LAN or HOST in {"0.0.0.0", "::"}):
+        info["lan_token"] = lan_access_token()
+    return info
+
+
+_PROCESS_START = time.time()
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return whether a process id is currently running on this machine.
+
+    Cross-platform: uses os.kill(pid, 0) on POSIX and tasklist on Windows.
+    """
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/fi", f"PID eq {pid}", "/fo", "csv", "/nh"],
+                capture_output=True, text=True, timeout=2,
+                encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+            )
+            stdout = (result.stdout or "").strip()
+            return bool(stdout) and "No tasks" not in stdout
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    except Exception:
+        return False
+
+
+def _read_pid_file(name: str) -> int:
+    """Read a launcher-managed pid file from the runtime directory."""
+    try:
+        path = DATA_DIR / "runtime" / f"{name}.pid"
+        return int(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return 0
+
+
+def health_check() -> dict:
+    """Return a cross-platform health report for diagnostics and monitoring.
+
+    Reports version, listen host/port, data directory, LAN mode, current
+    process id, uptime, and the live/dead status of launcher-managed
+    processes (web server, desktop pet).
+    """
+    web_pid = _read_pid_file("web")
+    pet_pid = _read_pid_file("pet")
+    return {
+        "ok": True,
+        "status": "running",
+        "version": current_app_version(),
+        "host": HOST,
+        "port": PORT,
+        "mode": "lan" if ALLOW_LAN or HOST in {"0.0.0.0", "::"} else "local",
+        "data_dir": str(DATA_DIR),
+        "platform": os.name,
+        "python": ".".join(str(v) for v in sys.version_info[:3]),
+        "pid": os.getpid(),
+        "uptime_seconds": int(time.time() - _PROCESS_START),
+        "processes": {
+            "web": {"pid": web_pid, "alive": _pid_alive(web_pid)},
+            "pet": {"pid": pet_pid, "alive": _pid_alive(pet_pid)},
         },
     }
 
@@ -1161,6 +1545,65 @@ def is_identity_set() -> bool:
     """检查是否已设置身份信息。"""
     identity = load_identity()
     return bool(identity.get("name", ""))
+
+
+def is_identity_question(message: str) -> bool:
+    """Recognize direct questions asking who the companion is."""
+    text = re.sub(r"\s+", "", str(message or "").lower())
+    if "你是谁的" in text:
+        return False
+    phrases = (
+        "你是谁", "你叫什么", "你的名字", "介绍一下你自己", "介绍你自己",
+        "你是做什么的", "你是什么", "whoareyou", "what'syourname", "whatsyourname",
+    )
+    return bool(text) and any(phrase in text for phrase in phrases)
+
+
+def _identity_relationship_label(identity: dict) -> str:
+    subtype_labels = {
+        "close_friend": "挚友", "best_friend": "最好的朋友", "classmate": "同学",
+        "daughter": "女儿", "son": "儿子", "mother": "母亲", "father": "父亲",
+        "older_sister": "姐姐", "older_brother": "哥哥", "younger_sister": "妹妹", "younger_brother": "弟弟",
+        "study_partner": "学习搭子", "work_partner": "工作搭档", "creative_partner": "创作搭档",
+        "game_partner": "游戏搭子", "health_guardian": "健康守护者", "routine_guardian": "作息守护者",
+        "emotion_guardian": "情绪守护者", "learning_lifeform": "学习型数字生命",
+        "explorer_lifeform": "探索型数字生命", "companion_lifeform": "陪伴型数字生命",
+        "assistant_lifeform": "助理型数字生命",
+    }
+    subtype = str(identity.get("relationship_subtype") or "").strip()
+    if subtype in subtype_labels:
+        return subtype_labels[subtype]
+    if str(identity.get("relationship_type") or "") == "custom":
+        return str(identity.get("relationship_label") or "").strip() or "陪伴伙伴"
+    return {
+        "friend": "朋友", "family": "家人", "partner": "搭档",
+        "guardian": "守护者", "lifeform": "数字生命",
+    }.get(str(identity.get("relationship_type") or ""), "陪伴伙伴")
+
+
+def identity_intro_reply(message: str) -> str:
+    """Return a configured companion introduction without invoking a model."""
+    if not is_identity_question(message):
+        return ""
+    identity = load_identity()
+    name = str(identity.get("name") or "").strip() or "Companion"
+    relation = _identity_relationship_label(identity)
+    try:
+        from user_profile import get_ai_address_to_user
+        address = str(get_ai_address_to_user() or "").strip()
+    except Exception:
+        address = ""
+    prefix = f"{address}，" if address else ""
+    persona = re.sub(r"\s+", " ", str(identity.get("persona") or "")).strip()[:160]
+    worldview = re.sub(r"\s+", " ", str(identity.get("worldview") or "")).strip()[:120]
+    reply = f"{prefix}我是{name}，你的{relation}。"
+    if persona:
+        reply += persona
+    elif worldview:
+        reply += f"我会按我们设定的背景陪着你。{worldview}"
+    elif not identity.get("name"):
+        reply += "我是运行在这台设备上的本地 AI 陪伴伙伴，会和你聊天、记住稳定偏好，也能帮你整理事情。"
+    return reply
 
 
 def external_api_style_context() -> str:
@@ -1365,6 +1808,7 @@ def load_moments() -> dict:
         post.setdefault("likes", 0)
         post.setdefault("liked_by_user", False)
         post.setdefault("author", "AI")
+        post.setdefault("image", "")
     return {"posts": [post for post in posts if isinstance(post, dict)][-80:]}
 
 
@@ -1380,6 +1824,7 @@ def save_moments(moments: dict) -> dict:
             "avatar": str(post.get("avatar") or "AI")[:8],
             "content": str(post.get("content") or "")[:800],
             "mood": str(post.get("mood") or "")[:40],
+            "image": str(post.get("image") or "")[:500],
             "visibility": str(post.get("visibility") or "private")[:20],
             "created_at": str(post.get("created_at") or ""),
             "likes": max(0, int(post.get("likes") or 0)),
@@ -1401,6 +1846,28 @@ def save_moments(moments: dict) -> dict:
     return data
 
 
+def _moment_image_url(image_path: str) -> str:
+    if not image_path:
+        return ""
+    try:
+        p = Path(image_path).resolve()
+        data_root = Path(DATA_DIR).resolve()
+        if data_root in p.parents or p.parent == data_root:
+            rel = p.relative_to(data_root)
+            return f"/data_image/{str(rel).replace(os.sep, '/')}"
+    except Exception:
+        pass
+    return ""
+
+
+def _moments_with_image_urls(moments: dict) -> dict:
+    posts = moments.get("posts", []) if isinstance(moments, dict) else []
+    for post in posts:
+        if isinstance(post, dict) and post.get("image"):
+            post["image_url"] = _moment_image_url(post.get("image", ""))
+    return moments
+
+
 def _moment_author() -> tuple[str, str]:
     identity = load_identity()
     name = str(identity.get("name") or "").strip() or "Companion AI"
@@ -1411,7 +1878,7 @@ def _moment_now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def create_moment(content: str, mood: str = "", author: str = "", avatar: str = "") -> dict:
+def create_moment(content: str, mood: str = "", author: str = "", avatar: str = "", image: str = "") -> dict:
     text = re.sub(r"\s+", " ", str(content or "")).strip()
     if not text:
         return {"ok": False, "error": "动态内容不能为空"}
@@ -1422,6 +1889,7 @@ def create_moment(content: str, mood: str = "", author: str = "", avatar: str = 
         "avatar": (avatar or default_avatar)[:8],
         "content": text[:800],
         "mood": str(mood or "")[:40],
+        "image": str(image or "")[:500],
         "visibility": "private",
         "created_at": _moment_now(),
         "likes": 0,
@@ -1457,7 +1925,30 @@ def generate_ai_moment() -> dict:
     else:
         content = "今天也在本机安静待命。没有新鲜大事，但我把每一次聊天都当成一点点靠近。"
         mood = "待机"
-    return create_moment(content, mood=mood)
+    image_path = ""
+    try:
+        from image_generator import generate_mood_card
+        from image_growth import record_generation, recommend_recipe
+        ai_name = str(identity.get("name") or "").strip() or "Companion AI"
+        recipe = recommend_recipe(mood)
+        seed = str(recipe.get("seed") or hashlib.sha1(f"{content}:{mood}".encode("utf-8")).hexdigest()[:16])
+        parameters = {"signature": ai_name, "learned_recipe": recipe.get("learned", False)}
+        try:
+            from local_image_backend import generate_comfyui_image, public_status
+            backend = public_status()
+            if backend.get("enabled") and backend.get("workflow_configured"):
+                image_path = generate_comfyui_image(f"{mood}。{content[:100]}", seed=seed)
+                parameters["backend"] = "comfyui"
+            else:
+                image_path = generate_mood_card(content[:100], mood=mood, signature=ai_name, seed=seed)
+                parameters["backend"] = "mood_card"
+        except Exception as exc:
+            image_path = generate_mood_card(content[:100], mood=mood, signature=ai_name, seed=seed)
+            parameters.update({"backend": "mood_card", "backend_fallback": str(exc)[:160]})
+        record_generation(image_path, kind=parameters["backend"], mood=mood, seed=seed, parameters=parameters)
+    except Exception:
+        pass
+    return create_moment(content, mood=mood, image=image_path)
 
 
 def handle_moments_post(payload: dict) -> dict:
@@ -1480,6 +1971,12 @@ def handle_moments_post(payload: dict) -> dict:
             post["likes"] = int(post.get("likes") or 0) + 1
         elif was_liked and not liked:
             post["likes"] = max(0, int(post.get("likes") or 0) - 1)
+        if post.get("image"):
+            try:
+                from image_growth import record_feedback
+                record_feedback(str(post["image"]), liked)
+            except Exception:
+                pass
     elif action == "comment":
         text = re.sub(r"\s+", " ", str(payload.get("text") or "")).strip()
         if not text:
@@ -1830,6 +2327,138 @@ def load_history_entries() -> list[dict]:
 
     write_sensitive_json(HISTORY_FILE, {"entries": entries[-2000:]})
     return entries[-2000:]
+
+
+def _recent_chat_title(text: str) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "").strip())
+    if not clean:
+        return "新对话"
+    return clean[:18] + ("..." if len(clean) > 18 else "")
+
+
+def _normalize_generated_chat_title(text: str) -> str:
+    title = re.sub(r"[\r\n\"'“”‘’《》【】#：:]+", " ", str(text or "")).strip()
+    title = re.sub(r"\s+", " ", title)
+    for prefix in ("标题", "对话标题", "名称", "对话名称"):
+        if title.startswith(prefix):
+            title = title[len(prefix):].lstrip(" ：:")
+    title = title.strip(" .。-—_")
+    if not title:
+        return ""
+    return title[:18] + ("..." if len(title) > 18 else "")
+
+
+def generate_chat_title(user_text: str, assistant_text: str) -> str:
+    seed = re.sub(r"\s+", " ", str(user_text or "").strip())
+    assistant_seed = re.sub(r"\s+", " ", str(assistant_text or "").strip())
+    prompt = (
+        "请为下面这轮对话生成一个简短中文标题，只输出标题本身，"
+        "不要解释，不要加引号，长度 2 到 10 个汉字。\n\n"
+        f"用户：{seed[:500]}\n"
+        f"助手：{assistant_seed[:500]}"
+    )
+    try:
+        from remote_llm import call_remote_llm, is_remote_llm_ready, load_remote_llm_config
+        config = load_remote_llm_config()
+        if is_remote_llm_ready(config):
+            config = dict(config)
+            config["temperature"] = 0.2
+            config["max_tokens"] = 32
+            config["timeout"] = min(int(config.get("timeout") or 10), 10)
+            title = _normalize_generated_chat_title(call_remote_llm(prompt, config=config))
+            if title and not title.startswith("["):
+                return title
+    except Exception:
+        pass
+    try:
+        from llm_inference import get_local_llm
+        llm = get_local_llm()
+        if getattr(llm, "loaded", False):
+            title = _normalize_generated_chat_title(llm.chat(prompt, history=None, max_new_tokens=32, temperature=0.2))
+            if title and not title.startswith("["):
+                return title
+    except Exception:
+        pass
+    try:
+        from tiny_llm import tiny_llm_chat
+        title = _normalize_generated_chat_title(tiny_llm_chat(prompt, history=None))
+        if title and title not in {"...", "。"} and not title.startswith("["):
+            return title
+    except Exception:
+        pass
+    return _recent_chat_title(seed)
+
+
+def load_recent_chats() -> list[dict]:
+    ensure_data()
+    data = read_sensitive_json(RECENT_CHATS_FILE, {"chats": []})
+    chats = data.get("chats", []) if isinstance(data, dict) else []
+    if not isinstance(chats, list):
+        chats = []
+    normalized = []
+    for chat in chats:
+        if not isinstance(chat, dict):
+            continue
+        chat_id = str(chat.get("id") or "").strip()
+        if not chat_id:
+            continue
+        messages = []
+        for item in chat.get("messages", []):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            text = str(item.get("text") or item.get("content") or "").strip()
+            if role not in {"user", "assistant"} or not text:
+                continue
+            messages.append({
+                "role": role,
+                "text": text[:4000],
+                "time": int(item.get("time") or chat.get("updated_at") or time.time()),
+            })
+        normalized.append({
+            "id": chat_id,
+            "title": str(chat.get("title") or _recent_chat_title(messages[0]["text"] if messages else "")).strip()[:40] or "新对话",
+            "created_at": int(chat.get("created_at") or chat.get("updated_at") or time.time()),
+            "updated_at": int(chat.get("updated_at") or chat.get("created_at") or time.time()),
+            "messages": messages[-80:],
+        })
+    normalized.sort(key=lambda item: int(item.get("updated_at") or 0), reverse=True)
+    return normalized[:30]
+
+
+def save_recent_chats(chats: list[dict]) -> None:
+    write_sensitive_json(RECENT_CHATS_FILE, {"chats": chats[:30]})
+
+
+def upsert_recent_chat(conversation_id: str, user_text: str, assistant_text: str) -> tuple[str, list[dict]]:
+    chats = load_recent_chats()
+    now = int(time.time())
+    chat_id = str(conversation_id or "").strip()
+    if not chat_id:
+        seed = f"{now}:{user_text}:{assistant_text}"
+        chat_id = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+    current = next((item for item in chats if item.get("id") == chat_id), None)
+    if current is None:
+        current = {
+            "id": chat_id,
+            "title": generate_chat_title(user_text, assistant_text),
+            "created_at": now,
+            "updated_at": now,
+            "messages": [],
+        }
+        chats.insert(0, current)
+    current["updated_at"] = now
+    if not current.get("title") or current.get("title") == "新对话":
+        current["title"] = generate_chat_title(user_text, assistant_text)
+    messages = list(current.get("messages", []))
+    if user_text:
+        messages.append({"role": "user", "text": str(user_text).strip()[:4000], "time": now})
+    if assistant_text:
+        messages.append({"role": "assistant", "text": str(assistant_text).strip()[:4000], "time": now})
+    current["messages"] = messages[-80:]
+    chats = [current] + [item for item in chats if item.get("id") != chat_id]
+    save_recent_chats(chats)
+    return chat_id, chats[:30]
 
 
 class TextExtractor(HTMLParser):
@@ -3130,6 +3759,62 @@ def analyze_text_emotion(text: str) -> dict:
     return {"label": label, "confidence": confidence, "evidence": evidence, "guidance": guidance}
 
 
+def compute_multimodal_emotion(text: str, typing_metrics: dict | None = None, punctuation: dict | None = None) -> dict:
+    """Compute emotion score combining text analysis, typing behavior, and punctuation density."""
+    base = analyze_text_emotion(text)
+    
+    typing = typing_metrics or {}
+    punct = punctuation or {}
+    
+    # Backspace ratio: > 25% suggests anxiety/hesitation
+    backspace_ratio = typing.get("backspaces", 0) / max(typing.get("keyCount", 1), 1)
+    if backspace_ratio > 0.25:
+        base["label"] = "焦虑/犹豫"
+        base["confidence"] = min(0.95, base["confidence"] + 0.2)
+        base["evidence"] = list(base.get("evidence", [])) + [f"退格率高({backspace_ratio:.1%})"]
+    
+    # Pauses: > 3 pauses suggests uncertainty
+    if typing.get("pauses", 0) > 3:
+        base["confidence"] = min(0.95, base["confidence"] + 0.1)
+        base["evidence"] = list(base.get("evidence", [])) + [f"输入犹豫({typing['pauses']}次停顿)"]
+    
+    # Exclamation density: >= 2 per 50 chars suggests strong emotion
+    text_len = len(text)
+    if text_len > 0:
+        excl_density = (punct.get("exclamation", 0) + punct.get("question", 0)) / text_len
+        if excl_density >= 0.04:  # >= 2 per 50 chars
+            base["label"] = "情绪较强/需要确认"
+            base["confidence"] = min(0.95, base["confidence"] + 0.15)
+            base["evidence"] = list(base.get("evidence", [])) + [f"标点密度高({excl_density:.1%})"]
+    
+    # Typing speed: very slow suggests deliberation/struggle
+    total_keys = typing.get("keyCount", 0)
+    duration_ms = typing.get("totalDuration", 0)
+    if total_keys > 5 and duration_ms > 0:
+        ms_per_key = duration_ms / total_keys
+        if ms_per_key > 2000:  # > 2s per key is very slow
+            base["confidence"] = min(0.95, base["confidence"] + 0.1)
+            base["evidence"] = list(base.get("evidence", [])) + [f"输入缓慢({ms_per_key:.0f}ms/键)"]
+    
+    return base
+
+
+def adjust_personality_warmth(label: str, current_warmth: float) -> float:
+    """Adjust warmth based on detected emotion."""
+    warm_labels = {"开心", "感激", "依恋", "期待"}
+    cold_labels = {"焦虑", "难过", "愤怒", "疲惫", "沮丧", "生气"}
+    
+    for warm in warm_labels:
+        if warm in label:
+            return min(100.0, current_warmth + 2.0)
+    
+    for cold in cold_labels:
+        if cold in label:
+            return max(0.0, current_warmth - 3.0)
+    
+    return current_warmth
+
+
 def normalize_emotion_label(label: str) -> str:
     cleaned = label.strip()
     if not cleaned:
@@ -3423,6 +4108,11 @@ def teach_example(prompt: str, response: str, source: str = "manual", rating: in
     training["examples"].append(item)
     save_training(training)
     sync_teach_example_to_indexes(prompt, response, source)
+    try:
+        from growth_loop import record_experience
+        record_experience(prompt, response, source=f"teach:{source}", evidence_type="human", reward=max(0, rating), evidence="用户通过 /teach 提供")
+    except Exception:
+        pass
     return f"已学到 1 条本地样本：以后遇到类似“{prompt[:40]}”的问题，我会优先参考这条回答。"
 
 
@@ -3891,6 +4581,53 @@ def apply_quick_feedback(feedback_id: str) -> str:
     )
 
 
+import threading
+import time
+
+_index_rebuild_timer = None
+_index_rebuild_lock = threading.Lock()
+_task_status = {"state": "idle", "progress": 0, "total": 0, "message": ""}
+
+def _set_task_status(state: str, message: str, progress: int = 0, total: int = 0) -> None:
+    global _task_status
+    _task_status = {"state": state, "progress": progress, "total": total, "message": message}
+
+def _clear_task_status_after(delay: float = 5.0) -> None:
+    def _clear():
+        global _task_status
+        if _task_status.get("state") in ("done", "error"):
+            _task_status = {"state": "idle", "progress": 0, "total": 0, "message": ""}
+    threading.Timer(delay, _clear).start()
+
+def _schedule_index_rebuild(delay: float = 2.0) -> None:
+    """Schedule a delayed embedding index rebuild to batch multiple training updates."""
+    global _index_rebuild_timer
+    
+    with _index_rebuild_lock:
+        if _index_rebuild_timer:
+            _index_rebuild_timer.cancel()
+        
+        def do_rebuild():
+            _set_task_status("rebuilding", "正在重建检索索引...")
+            try:
+                from hybrid_chat import rebuild_embedding_index
+                result = rebuild_embedding_index()
+                _set_task_status("done", f"索引重建完成：{result.get('rebuilt', 0)} 条记录，总计 {result.get('total', 0)} 条",
+                                 result.get("rebuilt", 0), result.get("total", 0))
+                print(f"[index] Auto-rebuilt: {result.get('rebuilt', 0)} records, total: {result.get('total', 0)}")
+            except Exception as e:
+                _set_task_status("error", f"索引重建失败：{e}")
+                print(f"[index] Auto-rebuild failed: {e}")
+            _clear_task_status_after(10.0)
+        
+        _index_rebuild_timer = threading.Timer(delay, do_rebuild)
+        _index_rebuild_timer.start()
+
+
+def get_task_status() -> dict:
+    return dict(_task_status)
+
+
 def record_feedback(prompt: str, response: str, rating: int) -> dict:
     training = load_training()
     cleaned_response = training_response_text(response)
@@ -3904,6 +4641,12 @@ def record_feedback(prompt: str, response: str, rating: int) -> dict:
     if row["rating"] > 0 and row["prompt"] and row["response"]:
         training["examples"].append({**row, "source": "feedback"})
     save_training(training)
+    try:
+        from growth_loop import record_experience
+        record_experience(row["prompt"], row["response"], source="feedback", evidence_type="user_approved" if row["rating"] > 0 else "", reward=row["rating"], evidence="用户点击回答反馈")
+    except Exception:
+        pass
+    _schedule_index_rebuild()
     return training
 
 
@@ -3929,6 +4672,12 @@ def record_correction(prompt: str, wrong_response: str, correct_response: str) -
         "wrong_response": cleaned_wrong_response,
     })
     save_training(training)
+    try:
+        from growth_loop import record_experience
+        record_experience(prompt, correct_response, source="correction", evidence_type="human", reward=1, evidence="用户提供纠正答案")
+    except Exception:
+        pass
+    _schedule_index_rebuild()
     return training
 
 
@@ -4406,6 +5155,186 @@ def export_model() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# 本地备份与迁移
+# ---------------------------------------------------------------------------
+
+BACKUP_FORMAT = "companion-backup"
+BACKUP_FORMAT_VERSION = 1
+BACKUP_DIR = DATA_DIR / "backups"
+# Transient / non-portable entries that must not be included in a backup.
+BACKUP_EXCLUDE_DIRS = {"backups", "updates", "ocr", "runtime"}
+BACKUP_EXCLUDE_SUFFIXES = {".pid", ".lock", ".tmp", ".bak"}
+BACKUP_EXCLUDE_NAMES = {"lan_token.json", "realtime_chat.json"}
+
+
+def _backup_excluded(path: Path, data_root: Path) -> bool:
+    """Return True if a path must be skipped during backup."""
+    try:
+        rel = path.relative_to(data_root)
+    except ValueError:
+        return True
+    parts = rel.parts
+    if parts and parts[0] in BACKUP_EXCLUDE_DIRS:
+        return True
+    if path.name in BACKUP_EXCLUDE_NAMES:
+        return True
+    if path.suffix.lower() in BACKUP_EXCLUDE_SUFFIXES:
+        return True
+    return False
+
+
+def create_backup(dest_path: Path | None = None, source_dir: Path | None = None) -> dict:
+    """Create a versioned, checksummed backup archive of the user data dir.
+
+    The archive contains a ``manifest.json`` with per-file SHA256 checksums and
+    metadata, plus the data files themselves. Transient state (pid files, the
+    LAN token, update downloads, the runtime venv, OCR cache) is excluded so
+    the package stays portable and safe to restore on a new machine.
+    """
+    import tarfile
+    import io
+
+    if source_dir is None:
+        source_dir = DATA_DIR
+        ensure_data()
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        if dest_path is None:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            dest_path = BACKUP_DIR / f"companion_backup_{stamp}.tar.gz"
+    else:
+        source_dir.mkdir(parents=True, exist_ok=True)
+        if dest_path is None:
+            dest_path = source_dir / "backups" / f"companion_backup_{datetime.now().strftime('%Y%m%d-%H%M%S')}.tar.gz"
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    manifest_entries: list[dict] = []
+    for root, dirs, files in os.walk(source_dir):
+        # Prune excluded directories in-place for os.walk efficiency.
+        dirs[:] = [d for d in dirs if not _backup_excluded(Path(root) / d, source_dir)]
+        for name in files:
+            fpath = Path(root) / name
+            if _backup_excluded(fpath, source_dir):
+                continue
+            try:
+                rel = fpath.relative_to(source_dir).as_posix()
+                sha = hashlib.sha256(fpath.read_bytes()).hexdigest()
+                size = fpath.stat().st_size
+            except Exception:
+                continue
+            manifest_entries.append({"path": rel, "sha256": sha, "size": size})
+
+    manifest = {
+        "format": BACKUP_FORMAT,
+        "version": BACKUP_FORMAT_VERSION,
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "app_version": current_app_version(),
+        "platform": os.name,
+        "file_count": len(manifest_entries),
+        "total_size": sum(e["size"] for e in manifest_entries),
+        "files": manifest_entries,
+    }
+
+    with tarfile.open(dest_path, "w:gz") as tar:
+        manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        info = tarfile.TarInfo(name="manifest.json")
+        info.size = len(manifest_bytes)
+        info.mtime = time.time()
+        tar.addfile(info, io.BytesIO(manifest_bytes))
+        for entry in manifest_entries:
+            tar.add(str(source_dir / entry["path"]), arcname=entry["path"])
+
+    archive_sha = hashlib.sha256(dest_path.read_bytes()).hexdigest()
+    return {
+        "ok": True,
+        "path": str(dest_path),
+        "archive_sha256": archive_sha,
+        "archive_size": dest_path.stat().st_size,
+        "file_count": manifest["file_count"],
+        "total_size": manifest["total_size"],
+        "created_at": manifest["created_at"],
+    }
+
+
+def restore_backup(archive_path: Path, target_data_dir: Path | None = None) -> dict:
+    """Validate and restore a backup archive into a data directory.
+
+    Files are checksum-verified against the manifest before any write happens.
+    If *target_data_dir* is omitted, the current DATA_DIR is used (in-place
+    restore). Existing files with the same relative path are overwritten.
+    """
+    import tarfile
+    import tempfile as _tempfile
+
+    if not archive_path.is_file():
+        return {"ok": False, "error": "备份文件不存在"}
+    dest = target_data_dir or DATA_DIR
+
+    try:
+        with tarfile.open(archive_path, "r:gz") as tar:
+            try:
+                manifest_file = tar.extractfile("manifest.json")
+            except KeyError:
+                return {"ok": False, "error": "备份缺少 manifest.json，可能已损坏"}
+            if manifest_file is None:
+                return {"ok": False, "error": "无法读取 manifest.json"}
+            try:
+                manifest = json.loads(manifest_file.read().decode("utf-8"))
+            except Exception as exc:
+                return {"ok": False, "error": f"manifest 解析失败：{exc}"}
+
+            if manifest.get("format") != BACKUP_FORMAT:
+                return {"ok": False, "error": f"不支持的备份格式：{manifest.get('format')}"}
+            if int(manifest.get("version") or 0) > BACKUP_FORMAT_VERSION:
+                return {"ok": False, "error": "备份版本高于当前程序支持，请升级 Companion AI"}
+
+            # Stage extraction to a temp dir, verify checksums, then move.
+            with _tempfile.TemporaryDirectory() as stage:
+                stage_path = Path(stage)
+                members = [m for m in tar.getmembers() if m.name != "manifest.json"]
+                # Safety: reject absolute paths or path traversal.
+                for m in members:
+                    if m.name.startswith("/") or ".." in Path(m.name).parts:
+                        return {"ok": False, "error": f"备份包含不安全路径：{m.name}"}
+                tar.extractall(stage_path, members=members)
+
+                # Verify every manifest entry matches its checksum.
+                verified = 0
+                for entry in manifest.get("files", []):
+                    rel = entry["path"]
+                    staged = stage_path / rel
+                    if not staged.is_file():
+                        return {"ok": False, "error": f"备份缺失文件：{rel}", "verified": verified}
+                    actual = hashlib.sha256(staged.read_bytes()).hexdigest()
+                    if actual != entry["sha256"]:
+                        return {"ok": False, "error": f"校验失败：{rel}", "verified": verified}
+                    verified += 1
+
+                # All checksums valid — move into the target data dir.
+                dest.mkdir(parents=True, exist_ok=True)
+                restored = 0
+                for entry in manifest.get("files", []):
+                    rel = entry["path"]
+                    src = stage_path / rel
+                    dst = dest / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    restored += 1
+
+    except tarfile.TarError as exc:
+        return {"ok": False, "error": f"备份读取失败：{exc}"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    return {
+        "ok": True,
+        "restored_files": restored,
+        "target_dir": str(dest),
+        "backup_created_at": manifest.get("created_at", ""),
+        "backup_app_version": manifest.get("app_version", ""),
+    }
+
+
 def infer_weather_location(message: str) -> str:
     cleaned = message.strip()
     for word in ["天气", "气温", "温度", "怎么样", "如何", "现在"]:
@@ -4439,45 +5368,45 @@ def source_grounded_web_reply(message: str, rule: dict) -> str:
     try:
         from web_learner import learn_from_web, learning_record_payload
     except Exception as exc:
-        return f"行为规则「{rule.get('title', '')}」需要联网搜索，但联网学习模块不可用：{exc}"
+        return f"联网学习模块不可用：{exc}"
 
     result = learn_from_web(message[:100])
     if not result.get("ok"):
-        return (
-            f"我命中了行为规则「{rule.get('title', '')}」，但联网确认失败：{result.get('error', '未知错误')}。\n"
-            "你可以检查 /learn_status，或稍后重试。"
-        )
+        return f"联网搜索暂时不可用：{result.get('error', '未知错误')}。你可以稍后重试。"
 
-    lines = [
-        f"我命中了行为规则「{rule.get('title', '')}」，已先联网核实公开资料。",
-        "",
-        f"查询：{result.get('query', message)}",
-        "",
-        "初步动态摘要：",
-    ]
-    for source in result.get("sources", [])[:3]:
-        title = re.sub(r"\s+", " ", str(source.get("title") or source.get("domain") or "")).strip()
-        excerpt = re.sub(r"\s+", " ", str(source.get("excerpt", ""))).strip()
-        if title:
-            lines.append(f"- {title}")
-        elif excerpt:
-            lines.append(f"- {excerpt[:120]}")
+    # Build a clean, user-friendly reply
+    sources = result.get("sources", [])
+    source_names = []
+    for s in sources[:3]:
+        name = s.get("domain") or s.get("title") or "来源"
+        source_names.append(name)
 
-    lines.extend([
-        "",
-        "可核查来源：",
-    ])
-    for idx, source in enumerate(result.get("sources", [])[:3], 1):
-        title = source.get("title") or source.get("domain") or "来源"
-        excerpt = re.sub(r"\s+", " ", str(source.get("excerpt", ""))).strip()
-        lines.append(f"{idx}. {title}")
-        lines.append(f"   {source.get('url', '')}")
-        if excerpt:
-            lines.append(f"   摘要：{excerpt[:220]}")
+    reply = f"我查了一下，找到了 {len(sources)} 个相关来源"
+    if source_names:
+        reply += f"（{', '.join(source_names[:3])}）"
+    reply += "。你可以让我基于这些资料给你整理一个更完整的回答。"
 
-    lines.append("")
-    lines.append("这些资料已经更新到本地联网学习记录；你也可以继续让我基于这些来源整理成更完整的结论。")
-    return "\n".join(lines) + "\n\n" + learning_record_payload(result)
+    return reply + "\n" + learning_record_payload(result)
+
+
+def is_companion_self_reflection_query(message: str) -> bool:
+    """Keep personal questions about the companion out of fresh-web routing."""
+    text = re.sub(r"\s+", "", str(message or "").lower())
+    if not text:
+        return False
+    refers_to_companion = any(marker in text for marker in ("你", "ai", "助手", "companion", "伙伴"))
+    personal_topics = ("学习", "新东西", "能力", "状态", "感受", "心情", "想法", "记得", "成长", "进步")
+    return refers_to_companion and any(topic in text for topic in personal_topics)
+
+
+def preferred_self_training_reply(message: str) -> str:
+    """Return a confirmed training reply for a question about the companion itself."""
+    if not is_companion_self_reflection_query(message):
+        return ""
+    match, score = best_training_match(message)
+    if not match or score < 0.28:
+        return ""
+    return training_response_text(str(match.get("response") or ""))
 
 
 def procedural_rule_reply(message: str) -> str | None:
@@ -4490,15 +5419,21 @@ def procedural_rule_reply(message: str) -> str | None:
     if not rule:
         return None
     if rule.get("action") == "web_search":
+        if is_companion_self_reflection_query(message):
+            return None
         return source_grounded_web_reply(message, rule)
 
     instruction = str(rule.get("instruction", "")).strip()
     if instruction:
-        return f"我命中了行为规则「{rule.get('title', '')}」，会按这条规则处理：\n{instruction}"
+        return f"好的，我会按你教我的方式来处理。"
     return None
 
 
 def local_reply(message: str, page: PageResult | None, file_record: dict | None = None, realtime_context: str = "") -> str:
+    trained_self_reply = preferred_self_training_reply(message)
+    if trained_self_reply:
+        return trained_self_reply
+
     remembered = []
     for bucket, text in extract_memory_candidates(message):
         remembered.append(add_memory(text, bucket, source="auto"))
@@ -4530,6 +5465,23 @@ def local_reply(message: str, page: PageResult | None, file_record: dict | None 
     api_style_context = external_api_style_context()
     api_personalization_context = external_api_personalization_context()
     memory_context = MEMORY_STORE.context_for(message)
+
+    # Get skill thought from dreaming engine if relevant
+    skill_thought = ""
+    try:
+        from dreaming_engine import get_skill_thought_for
+        skill_thought = get_skill_thought_for(message)
+    except Exception:
+        pass
+
+    # Get user's preferred address
+    user_address = ""
+    try:
+        from user_profile import get_ai_address_to_user
+        user_address = get_ai_address_to_user()
+    except Exception:
+        pass
+
     try:
         from conversation_audit import get_audit_context_for_chat
         audit_context = get_audit_context_for_chat()
@@ -4548,6 +5500,8 @@ def local_reply(message: str, page: PageResult | None, file_record: dict | None 
 
     if audit_context:
         context_for_chat += f"\n\n[审计反馈]\n{audit_context}"
+    if skill_thought:
+        context_for_chat += f"\n\n[自我演练思路]\n{skill_thought}"
     if realtime_context:
         context_for_chat += (
             "\n\n[实时感知上下文]\n"
@@ -4654,15 +5608,53 @@ def handle_chat(payload: dict) -> dict:
     message = str(payload.get("message", "")).strip()
     url = str(payload.get("url", "")).strip()
     file_id = str(payload.get("file_id", "")).strip()
+    conversation_id = str(payload.get("conversation_id", "")).strip()
     from_realtime = bool(payload.get("from_realtime"))
+    persist_history = str(payload.get("persist_history", True)).strip().lower() not in {"0", "false", "no", "off"}
     realtime_context = str(payload.get("realtime_context", "")).strip()
+    typing_metrics = payload.get("typing_metrics", {})
+    punctuation = payload.get("punctuation", {})
     user_message = message
     file_record = get_file_record(file_id)
-    if not message and not url and not file_record:
-        return {"reply": "你可以先说一句话，贴一个你有权访问的网页链接，或上传一个本地文件。"}
 
-    append_history("user", user_message or f"[url]{url}" or f"[file]{file_id}")
-    record_emotion_message("user", user_message)
+    # Notify dreaming engine of user activity
+    try:
+        from dreaming_engine import touch_chat_activity
+        touch_chat_activity()
+    except Exception:
+        pass
+
+    # Record chat turn for proactive engagement
+    try:
+        from proactive_engagement import record_chat_turn
+        record_chat_turn()
+    except Exception:
+        pass
+
+    # Check for dream-engine showoff messages
+    showoff_prefix = ""
+    try:
+        from dreaming_engine import consume_showoffs
+        showoffs = consume_showoffs()
+        if showoffs:
+            showoff_prefix = "\n\n".join(showoffs) + "\n\n---\n\n"
+    except Exception:
+        pass
+
+    # Get user's preferred address
+    user_address = ""
+    try:
+        from user_profile import get_ai_address_to_user
+        user_address = get_ai_address_to_user()
+    except Exception:
+        pass
+
+    if not message and not url and not file_record:
+        return {"reply": showoff_prefix + "你可以先说一句话，贴一个你有权访问的网页链接，或上传一个本地文件。"}
+
+    if persist_history:
+        append_history("user", user_message or f"[url]{url}" or f"[file]{file_id}")
+        record_emotion_message("user", user_message)
     if from_realtime and user_message:
         append_realtime_chat_message("user", user_message)
 
@@ -4670,18 +5662,30 @@ def handle_chat(payload: dict) -> dict:
     plugin_result = plugin_mgr.handle_message(user_message)
     if plugin_result and "reply" in plugin_result:
         reply = plugin_result["reply"]
-        append_history("assistant", reply)
-        record_emotion_message("assistant", reply)
+        recent_chats = []
+        if persist_history:
+            append_history("assistant", reply)
+            record_emotion_message("assistant", reply)
+            conversation_id, recent_chats = upsert_recent_chat(conversation_id, user_message or f"[url]{url}" or f"[file]{file_id}", reply)
         if from_realtime:
             append_realtime_chat_message("assistant", training_response_text(reply))
         return {
             "reply": reply,
+            "conversation_id": conversation_id,
+            "recent_chats": recent_chats,
             "memory": load_memory(),
             "training": load_training(),
             "files": load_files(),
             "avatar": avatar_state(choose_motion(user_message, reply)),
             "growth": growth_payload(),
         }
+
+    lastEmotion = ""
+    try:
+        multimodal_emotion = compute_multimodal_emotion(user_message, typing_metrics, punctuation)
+        lastEmotion = multimodal_emotion.get("label", "")
+    except Exception:
+        pass
 
     memory_transfer_reply = handle_memory_transfer_command(user_message)
     if memory_transfer_reply is not None:
@@ -4690,7 +5694,7 @@ def handle_chat(payload: dict) -> dict:
         reply = add_memory(user_message.removeprefix("/remember ").strip(), "facts")
     elif user_message == "/memory":
         reply = memory_text()
-    elif message in {"/profile", "/profile_on", "/profile_off", "/profile_clear"}:
+    elif message in {"/profile", "/profile_on", "/profile_off", "/profile_clear"} or message.startswith("/name "):
         reply = handle_profile_command(message) or profile_summary()
     elif message in {"/routine", "/routine_status", "/routine_security", "/routine_reset_key", "/routine_on", "/routine_off", "/routine_summary", "/routine_reminders_on", "/routine_reminders_off", "/routine_pop", "/startup_on", "/startup_off"}:
         reply = handle_routine_command(message) or routine_status_text()
@@ -5056,7 +6060,8 @@ def handle_chat(payload: dict) -> dict:
             )
         else:
             reply = (
-                "神经网络暂时不能训练：PyTorch 未安装。\n"
+                "神经网络暂时不能训练。\n"
+                f"原因：{result.get('runtime_error') or result.get('error') or '组件虚拟环境中的 PyTorch 不可用'}\n"
                 "当前设计已经支持 GPU：NVIDIA 可用 CUDA，AMD/Intel Windows 显卡可用 torch-directml。\n"
                 "建议用安装器自动创建 Python 3.12 .venv 并安装对应后端。"
             )
@@ -5171,8 +6176,8 @@ def handle_chat(payload: dict) -> dict:
             lines.append("\n用法示例:")
             lines.append("  /train_dataset emotion_en          ← 使用配置中的数据集")
             lines.append("  /train_dataset hf:emotion          ← 直接从 HuggingFace 加载")
-            lines.append("  /train_dataset ms:DAMO-NLP-MT/multi-m3e  ← 直接从 ModelScope 加载")
-            lines.append("  /train_dataset DAMO-NLP-MT/multi-m3e     ← 含 / 默认按 HuggingFace 处理")
+            lines.append("  /train_dataset ms:<ModelScope 数据集 ID>  ← 直接从 ModelScope 加载")
+            lines.append("  /train_dataset hf:<HuggingFace 数据集 ID> ← 直接从 HuggingFace 加载")
             reply = "\n".join(lines)
         except Exception as exc:
             reply = f"加载失败: {exc}"
@@ -5220,6 +6225,12 @@ def handle_chat(payload: dict) -> dict:
             reply = handle_code_autolearn_command(message) or "未知代码自学命令。"
         except Exception as exc:
             reply = f"代码自学命令失败: {exc}"
+    elif message in {"/algorithm_curriculum", "/algorithm_curriculum_status", "/algorithm_curriculum_dataset"} or message.startswith("/algorithm_curriculum_train"):
+        try:
+            from algorithm_curriculum import handle_algorithm_curriculum_command
+            reply = handle_algorithm_curriculum_command(message) or "未知算法课程命令。"
+        except Exception as exc:
+            reply = f"算法课程命令失败: {exc}"
     elif message == "/llm" or message == "/llm_status":
         try:
             from llm_inference import get_local_llm
@@ -5323,7 +6334,7 @@ def handle_chat(payload: dict) -> dict:
                     mark = " ●" if m["active"] else ""
                     lines.append(f"  {m['name']}{mark}")
                 lines.append("\n切换: /chat_mode <模式名>")
-                lines.append("模式: retrieval / tiny_llm / hybrid / local_llm / api_llm")
+                lines.append("模式: retrieval / tiny_llm / sparse_tiny_llm / hybrid / local_llm / api_llm")
                 reply = "\n".join(lines)
             else:
                 mode_name = message.removeprefix("/chat_mode ").strip()
@@ -5350,6 +6361,17 @@ def handle_chat(payload: dict) -> dict:
             else:
                 lines.append("  Tiny LLM: 未训练 (用 /train_tiny 训练)")
             try:
+                from tiny_llm import PANGU_PI_MODEL_FILE, SPARSE_MODEL_FILE
+                if PANGU_PI_MODEL_FILE.exists():
+                    sparse_state = f"已训练（盘古 pi 增强，{PANGU_PI_MODEL_FILE.stat().st_size / 1024:.0f} KB）"
+                elif SPARSE_MODEL_FILE.exists():
+                    sparse_state = f"已训练（旧稀疏权重兼容，{SPARSE_MODEL_FILE.stat().st_size / 1024:.0f} KB）"
+                else:
+                    sparse_state = "未训练（用 /train_sparse 训练）"
+                lines.append(f"  稀疏增强 Tiny LLM: {sparse_state}")
+            except Exception:
+                lines.append("  稀疏增强 Tiny LLM: 状态未知")
+            try:
                 from llm_inference import get_local_llm
                 llm = get_local_llm()
                 lines.append(f"  本地 LLM: {'已加载' if llm.loaded else '未加载'}")
@@ -5367,9 +6389,112 @@ def handle_chat(payload: dict) -> dict:
             reply = "hybrid_chat 模块未找到。"
         except Exception as exc:
             reply = f"状态查询失败: {exc}"
+    elif message == "/image_growth":
+        try:
+            from image_growth import status
+            image_status = status()
+            reply = (
+                "图片配方成长状态：\n"
+                f"  已记录生成：{image_status['generated']} 张\n"
+                f"  用户采用：{image_status['accepted']} 张\n"
+                f"  用户未采用：{image_status['rejected']} 张\n"
+                "在动态页给带图片的 AI 动态点赞，会将该图的本地配方作为对应心情的偏好。"
+            )
+        except Exception as exc:
+            reply = f"图片成长状态读取失败: {exc}"
+    elif message == "/growth_eval":
+        try:
+            from growth_loop import list_benchmarks
+            benchmarks = list_benchmarks()
+            lines = ["固定能力评测集（只评测，不参与训练）："]
+            if not benchmarks:
+                lines.append("  暂无。添加：/growth_eval_add 用户问题 => 必须出现的关键词1,关键词2")
+            for item in benchmarks:
+                lines.append(f"- {item['id']}｜{item['title']}｜关键词：{', '.join(item['expected_keywords'])}")
+            lines.append("删除：/growth_eval_remove 评测ID")
+            reply = "\n".join(lines)
+        except Exception as exc:
+            reply = f"评测集读取失败: {exc}"
+    elif message.startswith("/growth_eval_add "):
+        try:
+            from growth_loop import add_benchmark
+            body = message.removeprefix("/growth_eval_add ").strip()
+            if "=>" not in body:
+                reply = "格式：/growth_eval_add 用户问题 => 必须出现的关键词1,关键词2"
+            else:
+                prompt, keywords = body.split("=>", 1)
+                result = add_benchmark(prompt, keywords)
+                reply = f"已添加评测题：{result['benchmark']['id']}" if result.get("ok") else f"添加失败: {result.get('error')}"
+        except Exception as exc:
+            reply = f"评测题添加失败: {exc}"
+    elif message.startswith("/growth_eval_remove "):
+        try:
+            from growth_loop import remove_benchmark
+            benchmark_id = message.removeprefix("/growth_eval_remove ").strip()
+            reply = "评测题已删除。" if remove_benchmark(benchmark_id) else "未找到该评测 ID。"
+        except Exception as exc:
+            reply = f"评测题删除失败: {exc}"
+    elif message.startswith("/growth_eval_update "):
+        try:
+            from growth_loop import update_benchmark
+            body = message.removeprefix("/growth_eval_update ").strip()
+            parts = body.split(" ", 1)
+            if len(parts) != 2 or "=>" not in parts[1]:
+                reply = "格式：/growth_eval_update 评测ID 新问题 => 新关键词1,新关键词2"
+            else:
+                prompt, keywords = parts[1].split("=>", 1)
+                result = update_benchmark(parts[0], prompt, keywords)
+                reply = "评测题已更新。" if result.get("ok") else f"更新失败: {result.get('error')}"
+        except Exception as exc:
+            reply = f"评测题更新失败: {exc}"
+    elif message == "/growth_status":
+        try:
+            from growth_loop import growth_status
+            status = growth_status()
+            reply = (
+                "本地成长闭环状态：\n"
+                f"  可训练验证经验：{status['eligible_experiences']} 条\n"
+                f"  下次训练回放：{status['replay_samples']} 条（核心 {status['replay_core_samples']}，留出评测 {status['held_out_samples']}）\n"
+                f"  当前版本：{status['active_version']}\n"
+                f"  可回滚版本：{status['previous_version']}\n"
+                f"  未通过候选：{status['rejected_candidates']} 个\n"
+                "命令：/growth_eval；/growth_eval_add 问题 => 关键词1,关键词2；/train_tiny [轮数]；/growth_rollback"
+            )
+        except Exception as exc:
+            reply = f"成长状态读取失败: {exc}"
+    elif message == "/growth_rollback":
+        try:
+            from growth_loop import rollback_active_model
+            result = rollback_active_model()
+            reply = f"已回滚到版本：{result.get('active_version')}" if result.get("ok") else f"回滚失败: {result.get('error', '未知错误')}"
+        except Exception as exc:
+            reply = f"回滚出错: {exc}"
     elif message == "/train_tiny" or message.startswith("/train_tiny "):
         try:
-            from tiny_llm import train_tiny_llm
+            from growth_jobs import start as start_growth_training
+            epochs = 3
+            parts = message.split()
+            if len(parts) > 1:
+                try:
+                    epochs = int(parts[1])
+                except ValueError:
+                    pass
+            result = start_growth_training(epochs=epochs)
+            if result.get("ok"):
+                reply = (
+                    "Tiny LLM 候选训练已进入后台队列。\n"
+                    "训练完成后会自动进行留出集与固定能力评测；只有通过才会激活。\n"
+                    "可在设置页“本地自成长”查看进度或取消训练。"
+                )
+            else:
+                reply = f"训练任务未启动: {result.get('error', '未知错误')}"
+        except ImportError:
+            reply = "tiny_llm 模块未找到。"
+        except Exception as exc:
+            reply = f"训练出错: {exc}"
+    elif message == "/train_sparse" or message.startswith("/train_sparse "):
+        try:
+            from tiny_llm import train_tiny_llm_in_runtime
             epochs = 3
             parts = message.split()
             if len(parts) > 1:
@@ -5378,31 +6503,49 @@ def handle_chat(payload: dict) -> dict:
                 except ValueError:
                     pass
             training = load_training()
-            texts = []
-            for item in training.get("examples", []):
-                prompt = str(item.get("prompt", "")).strip()
-                response = str(item.get("response", "")).strip()
-                if prompt and response and item.get("rating", 1) > 0:
-                    texts.append(f"用户：{prompt}\n助手：{response}")
+            texts = [
+                f"用户：{str(item.get('prompt', '')).strip()}\n助手：{str(item.get('response', '')).strip()}"
+                for item in training.get("examples", [])
+                if str(item.get("prompt", "")).strip() and str(item.get("response", "")).strip() and item.get("rating", 1) > 0
+            ]
             if not texts:
                 reply = "训练失败: 还没有可用教学样本。可以先用 /teach 问法 => 回答 添加样本。"
                 return {"reply": reply, "state": state_payload()}
-            reply = f"开始训练 Tiny LLM（{epochs} 轮），请稍候..."
-            result = train_tiny_llm(texts=texts, epochs=epochs)
+            result = train_tiny_llm_in_runtime(texts=texts, epochs=epochs, attention_type="pangu_pi_sparse")
             if result.get("ok"):
-                reply = (
-                    f"Tiny LLM 训练完成：\n"
-                    f"  样本: {result.get('samples', len(texts))} 条\n"
-                    f"  词表: {result.get('vocab_size', '?')} 个\n"
-                    f"  轮数: {result.get('epochs', epochs)}\n"
-                    f"  loss: {result.get('final_loss', '?')}\n"
-                    f"  耗时: {result.get('time', '?')}s\n"
-                    f"  模型: {result.get('model_path', '?')}"
-                )
+                reply = f"稀疏增强 Tiny LLM 训练完成：\n  样本: {result.get('samples')} 条\n  loss: {result.get('final_loss')}\n  模型: {result.get('model_path')}\n使用 /chat_mode sparse_tiny_llm 切换。"
             else:
                 reply = f"训练失败: {result.get('error', '未知错误')}"
         except ImportError:
-            reply = "tiny_llm 模块未找到。"
+            reply = "需要可用的 PyTorch 运行时才能训练稀疏增强模型。"
+        except Exception as exc:
+            reply = f"训练出错: {exc}"
+    elif message == "/train_pangu_pi" or message.startswith("/train_pangu_pi "):
+        try:
+            from tiny_llm import train_tiny_llm_in_runtime
+            epochs = 3
+            parts = message.split()
+            if len(parts) > 1:
+                try:
+                    epochs = int(parts[1])
+                except ValueError:
+                    pass
+            training = load_training()
+            texts = [
+                f"用户：{str(item.get('prompt', '')).strip()}\n助手：{str(item.get('response', '')).strip()}"
+                for item in training.get("examples", [])
+                if str(item.get("prompt", "")).strip() and str(item.get("response", "")).strip() and item.get("rating", 1) > 0
+            ]
+            if not texts:
+                reply = "训练失败: 还没有可用教学样本。可以先用 /teach 问法 => 回答 添加样本。"
+                return {"reply": reply, "state": state_payload()}
+            result = train_tiny_llm_in_runtime(texts=texts, epochs=epochs, attention_type="pangu_pi_sparse")
+            if result.get("ok"):
+                reply = f"盘古 pi 稀疏 Tiny LLM 训练完成：\n  样本: {result.get('samples')} 条\n  loss: {result.get('final_loss')}\n  模型: {result.get('model_path')}\n使用 /chat_mode pangu_pi_sparse_tiny_llm 切换。"
+            else:
+                reply = f"训练失败: {result.get('error', '未知错误')}"
+        except ImportError:
+            reply = "需要安装 PyTorch 才能训练盘古 pi 稀疏模型。"
         except Exception as exc:
             reply = f"训练出错: {exc}"
     elif message == "/retrain":
@@ -5465,71 +6608,152 @@ def handle_chat(payload: dict) -> dict:
         except Exception as exc:
             import traceback
             reply = f"创建插件出错：{exc}\n{traceback.format_exc()[:500]}"
+    elif message.startswith("/dream"):
+        try:
+            from dreaming_engine import handle_dream_command
+            if message in ("/dream_now", "/dream_practice"):
+                _set_task_status("rebuilding", "正在执行梦境任务...")
+            reply = handle_dream_command(message) or "未知梦境命令。可用：/dream_status /dream_on /dream_off /dream_now /dream_practice /dream_skills"
+            if message in ("/dream_now", "/dream_practice"):
+                _set_task_status("done", reply[:80])
+                _clear_task_status_after(5.0)
+        except ImportError:
+            reply = "dreaming_engine 模块未找到。"
+        except Exception as exc:
+            reply = f"梦境命令失败: {exc}"
+            if message in ("/dream_now", "/dream_practice"):
+                _set_task_status("error", f"梦境任务失败：{exc}")
+                _clear_task_status_after(5.0)
+    elif message.startswith("/proactive"):
+        try:
+            from proactive_engagement import handle_proactive_command
+            reply = handle_proactive_command(message) or "未知主动对话命令。可用：/proactive_status /proactive_on /proactive_off /proactive_test"
+        except ImportError:
+            reply = "proactive_engagement 模块未找到。"
+        except Exception as exc:
+            reply = f"主动对话命令失败: {exc}"
+    elif message.startswith("/distill"):
+        try:
+            from knowledge_distillation import handle_distillation_command
+            if message in ("/distill_now",):
+                _set_task_status("rebuilding", "正在进行知识蒸馏...")
+            reply = handle_distillation_command(message) or "未知知识蒸馏命令。可用：/distill_status /distill_on /distill_off /distill_now /distill_queue"
+            if message in ("/distill_now",):
+                _set_task_status("done", reply[:80])
+                _clear_task_status_after(5.0)
+        except ImportError:
+            reply = "knowledge_distillation 模块未找到。"
+        except Exception as exc:
+            reply = f"知识蒸馏命令失败: {exc}"
+            if message in ("/distill_now",):
+                _set_task_status("error", f"知识蒸馏失败：{exc}")
+                _clear_task_status_after(5.0)
     else:
-        skill = match_dialogue_skill(message)
-        if skill:
-            reply = skill_reply(skill, profile_context())
-            record_growth_event("dialogue_skill_triggered", skill.get("title", ""), {"skill_id": skill.get("id")})
+        identity_reply = identity_intro_reply(message)
+        if identity_reply:
+            reply = identity_reply
         else:
-            page = fetch_page(url) if url else None
-            reply = local_reply(message, page, file_record, realtime_context=realtime_context if from_realtime else "")
-        observe_user_message(message)
-        for bucket, text in extract_memory_candidates(message):
-            add_memory(text, bucket, source="auto")
-        observe_chat_interaction(message, reply)
+            skill = match_dialogue_skill(message)
+            if skill:
+                reply = skill_reply(skill, profile_context())
+                record_growth_event("dialogue_skill_triggered", skill.get("title", ""), {"skill_id": skill.get("id")})
+            else:
+                page = fetch_page(url) if url else None
+                reply = local_reply(message, page, file_record, realtime_context=realtime_context if from_realtime else "")
+        if persist_history:
+            observe_user_message(message)
+            for bucket, text in extract_memory_candidates(message):
+                add_memory(text, bucket, source="auto")
+            observe_chat_interaction(message, reply)
 
-        try:
-            from conversation_audit import submit_audit
-            history = load_history_entries()[-6:]
-            submit_audit(message, reply, history)
-        except Exception:
-            pass
+        if persist_history:
+            try:
+                from conversation_audit import submit_audit
+                history = load_history_entries()[-6:]
+                submit_audit(message, reply, history)
+            except Exception:
+                pass
 
-        try:
-            from plugin_manager import auto_create_plugin
-            from remote_llm import is_remote_llm_ready, load_remote_llm_config
-            llm_config = load_remote_llm_config()
-            if is_remote_llm_ready(llm_config):
-                auto_plugin_result = _evaluate_and_create_plugin(message, reply, history, llm_config)
-                if auto_plugin_result.get("ok"):
-                    plugin_name = auto_plugin_result.get("name")
-                    plugin_commands = ", ".join(b["command"] for b in auto_plugin_result.get("buttons", []))
-                    from companion_growth import apply_user_feedback
-                    store = load_growth()
-                    notes = store["personality"].setdefault("growth_notes", [])
-                    notes.append({
-                        "time": int(time.time()),
-                        "text": f"自主创建插件「{plugin_name}」，命令：{plugin_commands}",
-                    })
-                    store["personality"]["growth_notes"] = notes[-40:]
-                    save_growth(store)
-        except Exception:
-            pass
-
-        try:
-            from web_learner import learn_from_web, _load_trust_config
-            config = _load_trust_config()
-            if config.get("enabled") and config.get("auto_learn"):
-                if any(keyword in message for keyword in ["最新", "现在", "今天", "最近", "刚刚", "新闻", "更新", "什么是", "是什么"]):
-                    learn_result = learn_from_web(message[:100])
-                    if learn_result.get("ok"):
+        if persist_history:
+            try:
+                from plugin_manager import auto_create_plugin
+                from remote_llm import is_remote_llm_ready, load_remote_llm_config
+                llm_config = load_remote_llm_config()
+                if is_remote_llm_ready(llm_config):
+                    auto_plugin_result = _evaluate_and_create_plugin(message, reply, history, llm_config)
+                    if auto_plugin_result.get("ok"):
+                        plugin_name = auto_plugin_result.get("name")
+                        plugin_commands = ", ".join(b["command"] for b in auto_plugin_result.get("buttons", []))
+                        from companion_growth import apply_user_feedback
                         store = load_growth()
                         notes = store["personality"].setdefault("growth_notes", [])
                         notes.append({
                             "time": int(time.time()),
-                            "text": f"自主联网学习「{learn_result['query']}」，来源：{', '.join(s['domain'] for s in learn_result['sources'])}",
+                            "text": f"自主创建插件「{plugin_name}」，命令：{plugin_commands}",
                         })
                         store["personality"]["growth_notes"] = notes[-40:]
                         save_growth(store)
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-    append_history("assistant", reply)
-    record_emotion_message("assistant", reply)
+        if persist_history:
+            try:
+                from web_learner import learn_from_web, _load_trust_config
+                config = _load_trust_config()
+                if config.get("enabled") and config.get("auto_learn"):
+                    if any(keyword in message for keyword in ["最新", "现在", "今天", "最近", "刚刚", "新闻", "更新", "什么是", "是什么"]):
+                        learn_result = learn_from_web(message[:100])
+                        if learn_result.get("ok"):
+                            store = load_growth()
+                            notes = store["personality"].setdefault("growth_notes", [])
+                            notes.append({
+                                "time": int(time.time()),
+                                "text": f"自主联网学习「{learn_result['query']}」，来源：{', '.join(s['domain'] for s in learn_result['sources'])}",
+                            })
+                            store["personality"]["growth_notes"] = notes[-40:]
+                            save_growth(store)
+            except Exception:
+                pass
+
+    recent_chats = []
+    if persist_history:
+        append_history("assistant", reply)
+        record_emotion_message("assistant", reply)
+        conversation_id, recent_chats = upsert_recent_chat(conversation_id, user_message or f"[url]{url}" or f"[file]{file_id}", reply)
     if from_realtime:
         append_realtime_chat_message("assistant", training_response_text(reply))
+    
+    audit_status = {}
+    audit_corrections = []
+    try:
+        from conversation_audit import get_audit_status, get_pending_corrections
+        audit_status = get_audit_status()
+        audit_corrections = get_pending_corrections()
+    except Exception:
+        pass
+    
+    # Prepend any showoff messages to the reply
+    if showoff_prefix and not reply.startswith(showoff_prefix.strip()):
+        reply = showoff_prefix + reply
+
+    # Prepend user's preferred address if set
+    if user_address and not reply.startswith(user_address):
+        # Add address prefix naturally (not for every message, just for meaningful ones)
+        # Only add if the reply is substantial and doesn't already address the user
+        if len(reply) > 20 and not any(reply.lower().startswith(x) for x in ["好的", "嗯", "哦", "明白", "了解", "收到", user_address]):
+            reply = f"{user_address}，{reply}"
+
+    # Add reverse question if needed (every 3-5 turns)
+    try:
+        from proactive_engagement import ensure_reverse_question
+        reply = ensure_reverse_question(reply, lastEmotion)
+    except Exception:
+        pass
+
     return {
         "reply": reply,
+        "conversation_id": conversation_id,
+        "recent_chats": recent_chats,
         "memory": load_memory(),
         "training": load_training(),
         "files": load_files(),
@@ -5537,6 +6761,9 @@ def handle_chat(payload: dict) -> dict:
         "emotion_trend": get_emotion_trend(7),
         "diary_entries": get_diary_entries(7),
         "growth": growth_payload(),
+        "audit_status": audit_status,
+        "audit_corrections": audit_corrections,
+        "index_rebuild_status": get_task_status(),
     }
 
 
@@ -5560,11 +6787,12 @@ INDEX_HTML = r"""<!doctype html>
       --warn: #9a5b00;
       --good: #0b7a55;
       --bad: #c0392b;
+      --avatar: #dceaff;
       --font-scale: 1;
       --density-scale: 1;
       --ui-radius: 8px;
-      --sidebar-width: 320px;
-      --avatar-height: 170px;
+      --sidebar-width: 280px;
+      --avatar-height: 84px;
       --space-2: calc(14px * var(--density-scale));
       --space-3: calc(18px * var(--density-scale));
     }
@@ -5641,6 +6869,32 @@ INDEX_HTML = r"""<!doctype html>
     ::-webkit-scrollbar-track { background: var(--panel-soft); }
     ::-webkit-scrollbar-thumb {
       background: color-mix(in srgb, var(--muted) 58%, transparent);
+      border-radius: 999px;
+      border: 2px solid var(--panel-soft);
+    }
+    /* Hide scrollbars by default; only show on hover or while scrolling. */
+    :root {
+      --scrollbar-opacity: 0;
+      --scrollbar-transition: opacity 0.25s ease;
+    }
+    :root:hover {
+      --scrollbar-opacity: 0.7;
+    }
+    body.is-scrolling {
+      --scrollbar-opacity: 1;
+    }
+    html {
+      scrollbar-width: thin;
+      scrollbar-color: var(--muted) transparent;
+    }
+    ::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+      opacity: var(--scrollbar-opacity);
+      transition: opacity var(--scrollbar-transition);
+    }
+    ::-webkit-scrollbar-thumb {
+      background: color-mix(in srgb, var(--muted) 60%, transparent);
       border-radius: 999px;
       border: 2px solid var(--panel-soft);
     }
@@ -6177,6 +7431,8 @@ INDEX_HTML = r"""<!doctype html>
     .emotion-meta {
       display: none;
       padding: 8px 10px;
+      border: 0;
+      border-radius: var(--ui-radius);
       border-left: 0;
       background: var(--panel-soft);
       color: var(--muted);
@@ -6224,7 +7480,78 @@ INDEX_HTML = r"""<!doctype html>
       padding: 0 10px 10px;
       color: var(--ink);
       font-size: 13px;
-      white-space: normal;
+    }
+    .learning-record-body p {
+      margin: 0;
+    }
+    .audit-indicator {
+      display: none;
+      padding: 6px 12px;
+      border-radius: var(--ui-radius);
+      font-size: 12px;
+      font-weight: 650;
+      text-align: center;
+      animation: fadeIn 0.2s ease;
+    }
+    .audit-processing {
+      background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+      color: var(--accent);
+    }
+    .audit-completed {
+      background: color-mix(in srgb, var(--good) 12%, var(--panel));
+      color: var(--good);
+    }
+    .audit-failed {
+      background: color-mix(in srgb, var(--bad) 12%, var(--panel));
+      color: var(--bad);
+    }
+    .audit-correction {
+      background: color-mix(in srgb, var(--warn, #f59e0b) 10%, var(--panel));
+      border-left: 3px solid var(--warn, #f59e0b);
+      border-radius: var(--ui-radius);
+      padding: 10px 14px;
+      margin: 6px 0;
+      font-size: 13px;
+      animation: fadeIn 0.3s ease;
+    }
+    .audit-correction .correction-label {
+      font-weight: 700;
+      color: var(--warn, #f59e0b);
+      margin-bottom: 4px;
+    }
+    .audit-correction .correction-text {
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+    .audit-correction .correction-meta {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+    .task-indicator {
+      display: none;
+      padding: 6px 12px;
+      border-radius: var(--ui-radius);
+      font-size: 12px;
+      font-weight: 650;
+      text-align: center;
+      animation: fadeIn 0.2s ease;
+    }
+    .task-processing {
+      background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+      color: var(--accent);
+    }
+    .task-completed {
+      background: color-mix(in srgb, var(--good) 12%, var(--panel));
+      color: var(--good);
+    }
+    .task-failed {
+      background: color-mix(in srgb, var(--bad) 12%, var(--panel));
+      color: var(--bad);
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to { opacity: 1; transform: translateY(0); }
     }
     .learning-record-section {
       display: grid;
@@ -6661,13 +7988,928 @@ INDEX_HTML = r"""<!doctype html>
       max-height: 320px;
       object-fit: contain;
     }
+
+    /* Focus the chat workspace; contextual controls remain available on demand. */
+    aside {
+      background: var(--panel);
+      padding: calc(18px * var(--density-scale));
+    }
+    main { grid-template-rows: auto 84px minmax(0, 1fr) auto auto; }
+    header {
+      padding: calc(14px * var(--density-scale)) calc(28px * var(--density-scale));
+      background: var(--bg);
+    }
+    .avatar-stage {
+      grid-template-columns: 64px minmax(0, 1fr) minmax(220px, 320px);
+      min-height: var(--avatar-height);
+      gap: 12px;
+      padding: 8px calc(28px * var(--density-scale));
+      background: transparent;
+    }
+    .avatar { width: 58px; height: 58px; }
+    .live2d-frame { width: 64px; height: 64px; }
+    .avatar .head { left: 10px; top: 6px; width: 40px; height: 38px; border-width: 2px; }
+    .avatar .hair { left: 7px; top: 3px; width: 44px; height: 24px; }
+    .avatar .body { left: 15px; top: 41px; width: 31px; height: 19px; border-width: 2px; }
+    .avatar .eye { top: 22px; width: 5px; height: 7px; }
+    .avatar .eye.left { left: 22px; }
+    .avatar .eye.right { right: 22px; }
+    .avatar .mouth { left: 27px; top: 32px; width: 8px; height: 4px; border-bottom-width: 2px; }
+    #chat {
+      width: min(880px, 100%);
+      margin: 0 auto;
+      padding: calc(26px * var(--density-scale)) calc(24px * var(--density-scale));
+    }
+    .msg { max-width: min(720px, 92%); box-shadow: none; }
+    .assistant { background: transparent; }
+    form {
+      padding: 12px max(calc(28px * var(--density-scale)), calc((100vw - 880px) / 2));
+      background: var(--bg);
+    }
+    textarea { min-height: 54px; }
+    .sidebar-section-label {
+      margin: 20px 10px 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .secondary-nav { margin: 0 0 16px; padding: 0; }
+    .secondary-nav a { background: transparent; font-size: 13px; font-weight: 650; }
+    .secondary-nav a::after { content: ""; }
+    .sidebar-context { margin: 16px 0; }
+    .sidebar-context > summary {
+      cursor: pointer;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 700;
+      list-style: none;
+    }
+    .sidebar-context > summary::-webkit-details-marker { display: none; }
+    .sidebar-context > summary::after { content: "+"; float: right; color: var(--muted); font-size: 16px; font-weight: 400; }
+    .sidebar-context[open] > summary::after { content: "-"; }
+    .sidebar-context-body { padding-top: 12px; }
+    .composer-tools,
+    .realtime-options { border: 0; }
+    .composer-tools summary,
+    .realtime-options summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 12px;
+      list-style: none;
+    }
+    .composer-tools summary::-webkit-details-marker,
+    .realtime-options summary::-webkit-details-marker { display: none; }
+    .composer-tools summary::before { content: "+ "; color: var(--accent); font-size: 15px; }
+    .realtime-options summary::before { content: "◉ "; color: var(--accent-2); }
+    .composer-resources { display: grid; gap: 8px; padding-top: 8px; }
+    main { grid-template-rows: auto var(--avatar-height) minmax(0, 1fr) auto auto; }
+    .avatar-stage { display: grid; }
+    #welcome-message {
+      display: block;
+      max-width: 640px;
+      margin-top: 18px;
+      padding: 0;
+      line-height: 1.7;
+    }
+    #welcome-message::before {
+      content: "Companion";
+      display: block;
+      margin-bottom: 8px;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    form { display: block; padding: 14px 24px 12px; }
+    .inputs { width: min(760px, 100%); margin: 0 auto; gap: 7px; }
+    .voice-input-row {
+      align-items: flex-end;
+      gap: 6px;
+      padding: 8px;
+      border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--line));
+      border-radius: calc(var(--ui-radius) + 2px);
+      background: var(--panel);
+    }
+    .voice-input-row textarea {
+      min-height: 48px;
+      padding: 7px 8px;
+      background: transparent;
+    }
+    .voice-input-row button,
+    #send {
+      align-self: flex-end;
+      width: 38px;
+      min-width: 38px;
+      height: 36px;
+      min-height: 36px;
+      padding: 0;
+      border-radius: 6px;
+    }
+    .voice-input-row .realtime-voice-btn { width: 38px; min-width: 38px; }
+    #send { width: 74px; min-width: 74px; font-size: 12px; }
+    .composer-tools,
+    .realtime-options { padding-left: 4px; }
+    .suggestions-panel {
+      width: min(760px, 100%);
+      margin: 0 auto 10px;
+    }
+    .suggestions-panel > summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 12px;
+      list-style: none;
+    }
+    .suggestions-panel > summary::-webkit-details-marker { display: none; }
+    .suggestions-panel > summary::before { content: "+ "; color: var(--accent); font-size: 15px; }
+    .suggestions {
+      max-height: none;
+      padding: 8px 0 0;
+      background: transparent;
+    }
+    body { grid-template-columns: 232px minmax(0, 1fr); }
+    aside { padding: 22px 16px; }
+    .sidebar-brand { display: flex; align-items: center; gap: 10px; margin: 2px 10px 30px; font-size: 16px; }
+    .sidebar-brand-mark { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 8px; background: var(--accent); color: #fff; font-size: 12px; }
+    .sidebar-section-label { margin-top: 0; }
+    .secondary-nav { gap: 4px; }
+    .secondary-nav a { min-height: 38px; padding: 8px 12px; }
+    .secondary-nav a.active { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); color: var(--accent); font-weight: 750; }
+    main {
+      grid-template-columns: minmax(0, 1fr) 276px;
+      grid-template-rows: auto minmax(0, 1fr) auto auto;
+      column-gap: 24px;
+      padding: 0 28px;
+    }
+    header { grid-column: 1 / -1; margin: 0 -28px; padding-left: 28px; padding-right: 28px; }
+    .avatar-stage { display: none; }
+    #chat, form, .suggestions-panel { grid-column: 1; }
+    .realtime-pet-chat { display: none !important; }
+    #chat { grid-row: 2; width: min(760px, 100%); margin-left: 0; padding-left: 16px; }
+    form { grid-row: 3; padding-left: 0; padding-right: 0; }
+    .suggestions-panel { grid-row: 4; margin-left: 0; }
+    .context-rail { grid-column: 2; grid-row: 2 / 5; padding-top: 18px; min-width: 0; overflow: auto; }
+    .context-rail .sidebar-context { display: block; margin: 0; }
+    .context-rail .sidebar-context > summary { font-size: 14px; }
+    .context-rail .sidebar-context-body { padding-top: 16px; }
+    .context-rail .memory-orbit { min-height: 150px; margin-bottom: 12px; background: var(--panel-soft); }
+    .context-rail .memory-brain { width: 96px; height: 80px; }
+    .context-rail .memory { max-height: 92px; overflow: auto; padding: 10px; border-radius: var(--ui-radius); background: var(--panel-soft); }
+    .context-rail .growth-panel, .context-rail .files { margin-top: 12px; }
+    .companion-visual { display: grid; gap: 10px; min-height: 292px; margin-top: 22px; }
+    .companion-visual-tabs { display: inline-flex; justify-self: start; gap: 4px; padding: 3px; border-radius: var(--ui-radius); background: var(--panel-soft); }
+    .companion-visual-tabs button { width: auto; min-width: 0; height: 28px; min-height: 28px; padding: 0 10px; border-radius: max(2px, calc(var(--ui-radius) - 2px)); background: transparent; color: var(--muted); font-size: 12px; }
+    .companion-visual-tabs button.active { background: var(--panel); color: var(--ink); box-shadow: 0 1px 3px rgba(12, 18, 28, .08); }
+    .companion-visual-stage { min-height: 252px; overflow: hidden; border-radius: var(--ui-radius); background: var(--panel-soft); }
+    .companion-visual-stage iframe { display: block; width: 100%; height: 252px; border: 0; background: transparent; }
+    .companion-visual-stage .live2d-frame { display: block; width: 100%; height: 252px; mix-blend-mode: normal; }
+
+    /* SVG home reference layout: quiet navigation, open chat reading area, right-side companion stage. */
+    body {
+      grid-template-columns: 232px minmax(0, 1fr);
+      background: var(--bg);
+    }
+    aside {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      padding: 24px 16px;
+      background: var(--panel);
+      border-right: 0;
+    }
+    .sidebar-brand {
+      min-height: 34px;
+      margin: 0 6px 28px;
+      gap: 12px;
+      color: var(--ink);
+      font-size: 17px;
+      font-weight: 750;
+    }
+    .sidebar-brand-mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      object-fit: cover;
+      background: var(--accent);
+    }
+    .new-chat-btn {
+      align-self: stretch;
+      width: auto;
+      min-width: 0;
+      height: 38px;
+      margin: 0 0 26px;
+      border-radius: var(--ui-radius);
+      background: var(--accent);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 750;
+    }
+    .sidebar-section-label {
+      margin: 0 8px 9px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 750;
+    }
+    .secondary-nav {
+      display: grid;
+      gap: 4px;
+      margin: 0 0 34px;
+      padding: 0;
+    }
+    .secondary-nav a {
+      min-height: 42px;
+      padding: 0 12px;
+      border-radius: var(--ui-radius);
+      background: transparent;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 500;
+    }
+    .secondary-nav a.active {
+      background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+      color: var(--accent);
+      font-weight: 750;
+    }
+    .secondary-nav a.active::before {
+      content: "";
+      width: 12px;
+      height: 12px;
+      margin-right: 10px;
+      border-radius: 50%;
+      background: var(--accent);
+    }
+    .recent-chat-list {
+      display: grid;
+      gap: 7px;
+      margin-bottom: 16px;
+    }
+    .recent-chat {
+      width: 100%;
+      min-width: 0;
+      height: auto;
+      min-height: 39px;
+      padding: 9px 16px;
+      border-radius: var(--ui-radius);
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1.35;
+    }
+    .recent-chat.active {
+      min-height: 57px;
+      background: var(--panel-soft);
+      color: var(--ink);
+      font-weight: 650;
+    }
+    .recent-chat span,
+    .recent-chat small {
+      display: block;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .recent-chat small {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .recent-chat-empty {
+      padding: 10px 16px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .command-section,
+    #plugin-buttons,
+    .plugin-mgr,
+    .live2d-viewer-link,
+    aside .notice {
+      display: none;
+    }
+    main {
+      grid-template-columns: minmax(580px, 1fr) minmax(294px, 336px);
+      grid-template-rows: 68px minmax(0, 1fr) auto auto;
+      column-gap: 34px;
+      padding: 0 32px;
+      background: var(--bg);
+    }
+    header {
+      grid-column: 1 / -1;
+      min-height: 68px;
+      margin: 0 -32px;
+      padding: 0 40px;
+      background: var(--panel);
+      border-bottom: 0;
+    }
+    h1 {
+      font-size: 16px;
+      font-weight: 750;
+      line-height: 1.2;
+    }
+    h1::after {
+      content: "私密对话 · 本地保存";
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .header-tools {
+      margin-right: 60px;
+      gap: 14px;
+    }
+    #status::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 8px;
+      border-radius: 50%;
+      background: var(--accent-2);
+      vertical-align: -1px;
+    }
+    .language-select {
+      display: none;
+    }
+    .settings-btn {
+      top: 18px;
+      right: 40px;
+      width: 89px;
+      height: 32px;
+      border-radius: 6px;
+      background: var(--panel-soft);
+      color: var(--ink);
+      font-size: 0;
+    }
+    .settings-btn::before {
+      content: "...";
+      font-size: 18px;
+      line-height: 1;
+    }
+    .avatar-stage {
+      display: none;
+    }
+    #chat {
+      grid-column: 1;
+      grid-row: 2;
+      width: min(760px, 100%);
+      margin: 0 auto;
+      padding: 36px 0 28px;
+      gap: 22px;
+    }
+    .msg {
+      max-width: min(720px, 100%);
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+      color: var(--ink);
+      font-size: 15px;
+      line-height: 1.7;
+    }
+    .msg.assistant {
+      display: grid;
+      grid-template-columns: 40px minmax(0, 1fr);
+      column-gap: 14px;
+      align-self: flex-start;
+    }
+    .msg.assistant::before {
+      content: "";
+      grid-column: 1;
+      grid-row: 1 / span 2;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at 36% 38%, var(--accent) 0 2px, transparent 3px),
+        radial-gradient(circle at 64% 38%, var(--accent) 0 2px, transparent 3px),
+        linear-gradient(var(--avatar), var(--avatar));
+      box-shadow: inset 0 -12px 0 color-mix(in srgb, var(--accent) 10%, transparent);
+    }
+    .assistant-meta {
+      grid-column: 2;
+      grid-row: 1;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    .assistant-meta strong {
+      display: block;
+      margin-bottom: 2px;
+      color: var(--ink);
+      font-size: 14px;
+      font-weight: 500;
+    }
+    .msg.assistant .tts-play-btn {
+      grid-column: 2;
+      grid-row: 1;
+      justify-self: end;
+      width: 28px;
+      min-width: 28px;
+      height: 28px;
+      min-height: 28px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .msg.assistant:hover .tts-play-btn,
+    .msg.assistant:focus-within .tts-play-btn {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .msg.assistant .msg-body {
+      grid-column: 2;
+      grid-row: 2;
+      gap: 10px;
+    }
+    .msg.user {
+      align-self: flex-end;
+      max-width: min(390px, 70%);
+      padding: 18px 24px;
+      border-radius: var(--ui-radius);
+      background: #eaf1ff;
+      line-height: 1.65;
+    }
+    #welcome-message {
+      margin-top: 42px;
+    }
+    #welcome-message::before {
+      content: "";
+      grid-column: 1;
+      grid-row: 1 / span 2;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at 36% 38%, var(--accent) 0 2px, transparent 3px),
+        radial-gradient(circle at 64% 38%, var(--accent) 0 2px, transparent 3px),
+        linear-gradient(var(--avatar), var(--avatar));
+      box-shadow: inset 0 -12px 0 color-mix(in srgb, var(--accent) 10%, transparent);
+    }
+    .feedback {
+      margin-left: 54px;
+      gap: 10px;
+    }
+    .feedback button {
+      min-width: 96px;
+      height: 30px;
+      border-radius: 6px;
+      background: var(--panel-soft);
+      color: var(--muted);
+      font-size: 12px;
+      box-shadow: none;
+    }
+    form {
+      grid-column: 1;
+      grid-row: 3;
+      width: min(736px, 100%);
+      margin: 0 auto 30px;
+      padding: 0;
+      background: transparent;
+    }
+    .inputs {
+      width: 100%;
+      gap: 8px;
+    }
+    .voice-input-row {
+      min-height: 112px;
+      /* Keep tools clear of the rounded corners when --ui-radius is large. */
+      padding: 18px max(22px, calc(var(--ui-radius) * 0.55)) max(16px, calc(var(--ui-radius) * 0.55));
+      border: 1.5px solid #b9cdf3;
+      border-radius: var(--ui-radius);
+      background: var(--panel);
+      align-items: flex-end;
+      flex-wrap: wrap;
+      overflow: visible;
+    }
+    .voice-input-row textarea {
+      flex-basis: 100%;
+      min-height: 42px;
+      padding: 0;
+      background: transparent;
+      font-size: 13px;
+      border-radius: 0;
+    }
+    .voice-input-row button {
+      background: transparent;
+      color: var(--muted);
+      font-size: 16px;
+      border-radius: max(4px, min(12px, calc(var(--ui-radius) - 10px)));
+    }
+    .voice-input-row button:hover {
+      background: var(--panel-soft);
+      color: var(--ink);
+    }
+    #send {
+      margin-left: auto;
+      width: 68px;
+      min-width: 68px;
+      height: 24px;
+      min-height: 24px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 11px;
+      border-radius: max(4px, calc(var(--ui-radius) - 8px));
+    }
+    .suggestions-panel {
+      display: none;
+    }
+    .composer-tools,
+    .realtime-options {
+      display: block;
+      margin-top: 2px;
+    }
+    .composer-tools summary,
+    .realtime-options summary {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 2px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      cursor: pointer;
+      list-style: none;
+    }
+    .composer-tools summary::-webkit-details-marker,
+    .realtime-options summary::-webkit-details-marker { display: none; }
+    .composer-tools summary::before,
+    .realtime-options summary::before {
+      content: "+";
+      margin-right: 6px;
+      color: var(--accent);
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .composer-tools[open] summary::before,
+    .realtime-options[open] summary::before { content: "-"; }
+    .composer-resources {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+      padding: 10px 12px;
+      border-radius: var(--ui-radius);
+      background: var(--panel-soft);
+    }
+    .composer-resources input[type="file"] {
+      padding: 8px 10px;
+      border-radius: max(4px, calc(var(--ui-radius) - 4px));
+      background: var(--panel);
+    }
+    .realtime-options > div {
+      margin-top: 8px;
+      padding: 10px 12px;
+      border-radius: var(--ui-radius);
+      background: var(--panel-soft);
+    }
+    body.has-realtime-pet-chat main {
+      grid-template-rows: 68px minmax(0, 1fr) auto auto;
+    }
+    body.has-realtime-pet-chat .avatar-stage {
+      display: none !important;
+    }
+    .attach-btn {
+      flex: 0 0 auto;
+      width: 28px;
+      min-width: 28px;
+      height: 24px;
+      min-height: 24px;
+      padding: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1;
+    }
+    .attach-btn:hover,
+    .attach-btn.has-file {
+      background: var(--panel-soft);
+      color: var(--accent);
+    }
+    .context-rail {
+      grid-column: 2;
+      grid-row: 2 / 5;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      padding: 34px 8px 12px 0;
+      overflow: hidden;
+    }
+    .context-rail .sidebar-context {
+      flex: 0 0 auto;
+      margin: 0;
+    }
+    .context-rail .sidebar-context > summary {
+      min-height: 32px;
+      color: var(--ink);
+      font-size: 16px;
+      font-weight: 750;
+    }
+    .context-rail .sidebar-context > summary::after {
+      content: "收起";
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .context-rail .sidebar-context-body {
+      display: grid;
+      gap: 14px;
+      padding-top: 24px;
+    }
+    .context-rail .memory-orbit {
+      display: none;
+    }
+    .context-rail .memory-title {
+      margin: 0 0 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 750;
+    }
+    .context-rail .memory,
+    .context-rail .files,
+    .context-shortcuts {
+      margin: 0;
+      padding: 18px;
+      border-radius: 8px;
+      background: var(--panel-soft);
+      color: var(--ink);
+    }
+    .context-rail .memory {
+      max-height: 98px;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .context-rail .growth-panel {
+      display: none;
+    }
+    .context-rail .files {
+      font-size: 13px;
+    }
+    .context-rail .files summary {
+      min-height: 0;
+      padding: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 750;
+    }
+    .context-rail .files-body {
+      margin-top: 12px;
+    }
+    .context-shortcuts {
+      display: grid;
+      gap: 12px;
+      padding: 0;
+      background: transparent;
+    }
+    .context-shortcuts button {
+      width: 100%;
+      min-width: 0;
+      height: auto;
+      min-height: 24px;
+      padding: 0 18px;
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .context-shortcuts button:hover {
+      color: var(--accent);
+      background: transparent;
+    }
+    .companion-visual {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 10px;
+      margin-top: 12px;
+      overflow: hidden;
+    }
+    .companion-visual-tabs {
+      justify-self: start;
+      border-radius: var(--ui-radius);
+      background: var(--panel-soft);
+    }
+    .companion-visual-tabs button {
+      width: auto;
+      min-width: 0;
+      height: 28px;
+      min-height: 28px;
+      padding: 0 12px;
+      border-radius: max(2px, calc(var(--ui-radius) - 2px));
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .companion-visual-tabs button.active {
+      background: var(--panel);
+      color: var(--ink);
+      box-shadow: 0 1px 3px rgba(12, 18, 28, .08);
+    }
+    .companion-visual-stage {
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
+      border-radius: var(--ui-radius);
+      background: var(--panel-soft);
+    }
+    .companion-visual-stage iframe,
+    .companion-visual-stage .live2d-frame {
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      border: 0;
+      background: transparent;
+      mix-blend-mode: normal;
+    }
+    .companion-visual-stage iframe[hidden] {
+      display: none !important;
+    }
+
+    /* Quiet motion layer for the home chat surface. */
+    :root {
+      --motion-fast: 140ms;
+      --motion-base: 220ms;
+      --motion-slow: 360ms;
+      --motion-ease: cubic-bezier(.22, 1, .36, 1);
+    }
+    @keyframes ui-fade-up {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes ui-fade-in {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    @keyframes ui-pop-in {
+      from { opacity: 0; transform: translateY(10px) scale(.985); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    @keyframes ui-status-glow {
+      0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent-2) 0%, transparent); }
+      50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent-2) 24%, transparent); }
+    }
+    @keyframes ui-stage-breathe {
+      0%, 100% { filter: saturate(1) brightness(1); transform: scale(1); }
+      50% { filter: saturate(1.04) brightness(1.015); transform: scale(1.008); }
+    }
+    aside,
+    main,
+    header {
+      animation: ui-fade-in var(--motion-slow) var(--motion-ease) both;
+    }
+    main { animation-delay: 40ms; }
+    header { animation-delay: 70ms; }
+    .new-chat-btn,
+    .secondary-nav a,
+    .recent-chat,
+    .settings-btn,
+    .companion-visual-tabs button,
+    .context-shortcuts button,
+    .feedback button,
+    .voice-input-row button,
+    #send {
+      transition:
+        background var(--motion-fast) ease,
+        color var(--motion-fast) ease,
+        border-color var(--motion-fast) ease,
+        box-shadow var(--motion-base) var(--motion-ease),
+        transform var(--motion-base) var(--motion-ease),
+        opacity var(--motion-fast) ease;
+    }
+    .new-chat-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 18px color-mix(in srgb, var(--accent) 28%, transparent);
+    }
+    .new-chat-btn:active,
+    .secondary-nav a:active,
+    .recent-chat:active,
+    .settings-btn:active,
+    .voice-input-row button:active,
+    #send:active {
+      transform: translateY(0) scale(.985);
+    }
+    .secondary-nav a:hover {
+      background: color-mix(in srgb, var(--panel-soft) 86%, var(--panel));
+      color: var(--ink);
+      transform: translateX(2px);
+    }
+    .recent-chat:hover {
+      background: color-mix(in srgb, var(--panel-soft) 88%, transparent);
+      color: var(--ink);
+      transform: translateX(2px);
+    }
+    .recent-chat.active {
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--line) 70%, transparent);
+    }
+    .settings-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 14px rgba(12, 18, 28, .08);
+    }
+    #status::before {
+      animation: ui-status-glow 2.4s ease-in-out infinite;
+    }
+    .msg.msg-enter {
+      animation: ui-fade-up var(--motion-base) var(--motion-ease) both;
+    }
+    .msg.user.msg-enter {
+      animation-name: ui-pop-in;
+    }
+    .msg.assistant .tts-play-btn {
+      transition: opacity var(--motion-fast) ease, transform var(--motion-fast) ease, background var(--motion-fast) ease;
+    }
+    .msg.assistant:hover .tts-play-btn,
+    .msg.assistant:focus-within .tts-play-btn {
+      transform: translateY(-1px);
+    }
+    .voice-input-row {
+      transition:
+        border-color var(--motion-base) ease,
+        box-shadow var(--motion-base) var(--motion-ease),
+        background var(--motion-fast) ease,
+        transform var(--motion-base) var(--motion-ease);
+    }
+    .voice-input-row:focus-within {
+      border-color: color-mix(in srgb, var(--accent) 58%, #b9cdf3);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 14%, transparent), 0 10px 28px rgba(39, 110, 241, .08);
+      transform: translateY(-1px);
+    }
+    #send:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 16px color-mix(in srgb, var(--accent) 28%, transparent);
+    }
+    .companion-visual-stage {
+      transition: box-shadow var(--motion-base) ease, transform var(--motion-base) var(--motion-ease);
+      animation: ui-stage-breathe 5.6s ease-in-out infinite;
+      transform-origin: center bottom;
+    }
+    .companion-visual-tabs button:hover {
+      color: var(--ink);
+      transform: translateY(-1px);
+    }
+    .companion-visual-tabs button.active {
+      transition: background var(--motion-fast) ease, color var(--motion-fast) ease, box-shadow var(--motion-base) ease, transform var(--motion-base) ease;
+    }
+    .context-rail .memory,
+    .context-rail .files {
+      transition: transform var(--motion-base) var(--motion-ease), box-shadow var(--motion-base) ease;
+    }
+    .context-rail .memory:hover,
+    .context-rail .files:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 18px rgba(12, 18, 28, .05);
+    }
+    .settings-overlay.open {
+      animation: ui-fade-in 160ms ease both;
+    }
+    .settings-overlay.open .settings-panel {
+      animation: ui-pop-in 220ms var(--motion-ease) both;
+    }
+    .settings-category-button,
+    .theme-option,
+    .settings-section button {
+      transition: background var(--motion-fast) ease, color var(--motion-fast) ease, border-color var(--motion-fast) ease, transform var(--motion-fast) ease, box-shadow var(--motion-base) ease;
+    }
+    .settings-category-button:hover,
+    .theme-option:hover,
+    .settings-section button:hover {
+      transform: translateY(-1px);
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+      .companion-visual-stage,
+      #status::before {
+        animation: none !important;
+      }
+      .voice-input-row:focus-within,
+      .new-chat-btn:hover,
+      .recent-chat:hover,
+      .secondary-nav a:hover,
+      #send:hover {
+        transform: none !important;
+      }
+    }
+
     @media (max-width: 760px) {
       body { grid-template-columns: 1fr; }
       aside { display: none; }
-      main { grid-template-rows: auto 150px minmax(0, 1fr) auto auto; }
-      body.has-realtime-pet-chat main { grid-template-rows: auto 246px minmax(0, 1fr) auto auto; }
-      .avatar-stage { grid-template-columns: 120px minmax(0, 1fr); grid-template-rows: auto auto; padding: 10px 14px; }
-      .realtime-pet-chat { grid-column: 1 / -1; max-height: 132px; min-height: 90px; }
+      main { display: grid; grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr) auto auto; padding: 0; }
+      header { margin: 0; padding-left: 14px; padding-right: 14px; }
+      .context-rail { display: none; }
+      #chat, form, .suggestions-panel { grid-column: 1; }
+      body.has-realtime-pet-chat main { grid-template-rows: auto minmax(0, 1fr) auto auto; }
+      body.has-realtime-pet-chat .avatar-stage { display: none !important; }
+      .realtime-pet-chat { display: none !important; }
       .avatar { transform: scale(.86); }
       header { align-items: flex-start; flex-direction: column; }
       form { grid-template-columns: 1fr; }
@@ -6687,8 +8929,20 @@ INDEX_HTML = r"""<!doctype html>
     .settings-header { position: sticky; top: 0; z-index: 1; background: var(--panel); display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 28px 16px; border-bottom: 0; }
     .settings-panel h2 { margin: 0; font-size: 21px; color: var(--ink); }
     .settings-subtitle { margin-top: 4px; color: var(--muted); font-size: 13px; }
-    .settings-grid { padding: 22px 28px 28px; overflow: auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; align-items: stretch; }
-    .settings-section { min-width: 0; padding: 20px; border: 0; border-radius: var(--ui-radius); background: var(--panel); box-shadow: 0 8px 22px rgba(12, 18, 28, .05); }
+    .settings-grid { min-height: 0; overflow: hidden; display: grid; grid-template-columns: 224px minmax(0, 1fr); }
+    .settings-category-nav { min-width: 0; overflow: auto; padding: 18px 12px; background: var(--panel-soft); border-right: 1px solid var(--line); }
+    .settings-category-group { display: grid; gap: 4px; margin-bottom: 18px; }
+    .settings-category-group:last-child { margin-bottom: 0; }
+    .settings-category-label { margin: 0 10px 5px; color: var(--muted); font-size: 11px; font-weight: 700; }
+    .settings-category-button { display: flex; align-items: center; width: 100%; min-width: 0; height: 38px; margin: 0; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--ink); font-size: 13px; font-weight: 650; text-align: left; }
+    .settings-category-button:hover { background: color-mix(in srgb, var(--accent) 8%, var(--panel)); color: var(--accent); }
+    .settings-category-button.active { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); color: var(--accent); font-weight: 750; }
+    .settings-category-button.active::before { content: ""; width: 6px; height: 6px; margin-right: 9px; border-radius: 50%; background: var(--accent); }
+    .settings-content { min-width: 0; overflow: auto; padding: 22px 28px 28px; display: grid; align-content: start; gap: 16px; }
+    .settings-section { min-width: 0; padding: 20px; border: 1px solid color-mix(in srgb, var(--line) 72%, transparent); border-radius: var(--ui-radius); background: var(--panel); box-shadow: none; }
+    .settings-section[hidden] { display: none !important; }
+    .settings-section.settings-secondary-active { padding: 0; border: 0; border-radius: 0; background: transparent; }
+    .settings-section.settings-secondary-active > h3 { display: none; }
     .settings-section h3 { margin: 0 0 10px; font-size: 15px; color: var(--ink); }
     .settings-section .status { max-width: 100%; font-size: 14px; margin: 6px 0 10px; line-height: 1.55; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis; }
     .settings-section .status.ok { color: var(--good); }
@@ -6738,8 +8992,91 @@ INDEX_HTML = r"""<!doctype html>
     .settings-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: 10px 0; }
     .settings-check { display: inline-flex !important; align-items: center; gap: 8px; margin: 0 !important; color: var(--ink) !important; cursor: pointer; }
     .settings-control-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 12px 0; }
-    .settings-slider { margin: 10px 0; }
-    .settings-slider label { display: flex; justify-content: space-between; gap: 12px; color: var(--ink); }
+    .settings-slider {
+      display: grid;
+      gap: 11px;
+      margin: 12px 0;
+      padding: 13px 14px 15px;
+      border: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+      border-radius: calc(var(--ui-radius) + 2px);
+      background: color-mix(in srgb, var(--panel-soft) 86%, var(--panel));
+    }
+    .settings-slider label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0;
+      color: var(--ink);
+      font-weight: 700;
+    }
+    .settings-slider label span:first-child {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    .settings-slider-value {
+      flex: 0 0 auto;
+      min-width: 58px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--accent);
+      text-align: center;
+      font-size: 12px;
+      font-weight: 750;
+      font-variant-numeric: tabular-nums;
+    }
+    .settings-slider input[type="range"] {
+      --slider-progress: 50%;
+      width: 100%;
+      height: 18px;
+      margin: 0;
+      padding: 0;
+      appearance: none;
+      -webkit-appearance: none;
+      background: transparent;
+      cursor: pointer;
+    }
+    .settings-slider input[type="range"]::-webkit-slider-runnable-track {
+      height: 8px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--accent) var(--slider-progress), color-mix(in srgb, var(--line) 68%, var(--panel)) var(--slider-progress));
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--line) 64%, transparent);
+    }
+    .settings-slider input[type="range"]::-webkit-slider-thumb {
+      width: 20px;
+      height: 20px;
+      margin-top: -6px;
+      border: 3px solid var(--panel);
+      border-radius: 50%;
+      appearance: none;
+      -webkit-appearance: none;
+      background: var(--accent);
+      box-shadow: 0 5px 12px color-mix(in srgb, var(--accent) 28%, transparent);
+    }
+    .settings-slider input[type="range"]::-moz-range-track {
+      height: 8px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--line) 68%, var(--panel));
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--line) 64%, transparent);
+    }
+    .settings-slider input[type="range"]::-moz-range-progress {
+      height: 8px;
+      border-radius: 999px;
+      background: var(--accent);
+    }
+    .settings-slider input[type="range"]::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border: 3px solid var(--panel);
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 5px 12px color-mix(in srgb, var(--accent) 28%, transparent);
+    }
+    .settings-slider input[type="range"]:focus-visible {
+      outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent);
+      outline-offset: 4px;
+    }
     .theme-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(116px, 1fr)); gap: 8px; margin: 12px 0; }
     .theme-option { display: grid !important; grid-template-columns: auto 1fr; align-items: center; gap: 8px; min-height: 42px; padding: 8px 10px; border: 0; border-radius: var(--ui-radius); background: var(--panel-soft); color: var(--ink) !important; cursor: pointer; }
     .theme-option input { width: auto !important; margin: 0 !important; padding: 0 !important; }
@@ -6747,9 +9084,40 @@ INDEX_HTML = r"""<!doctype html>
     .custom-theme-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 10px; margin: 10px 0; padding: 12px; border-radius: var(--ui-radius); background: var(--panel-soft); }
     .custom-theme-grid label { margin: 0; color: var(--ink); }
     .custom-theme-grid input[type="color"] { width: 100%; height: 34px; padding: 2px; margin: 4px 0 0; background: var(--panel); cursor: pointer; }
-    .theme-preview { min-height: 74px; margin-top: 10px; padding: 12px; border: 0; border-radius: var(--ui-radius); background: var(--panel-soft); color: var(--ink); }
+    .theme-preview { min-height: 112px; margin-top: 12px; padding: 13px; border: 0; border-radius: var(--ui-radius); background: var(--panel-soft); color: var(--ink); }
     .theme-preview strong { display: block; margin-bottom: 6px; color: var(--ink); }
     .theme-preview span { color: var(--muted); }
+    .theme-preview-surface {
+      display: grid;
+      grid-template-columns: minmax(42px, var(--preview-sidebar-width, 72px)) minmax(0, 1fr);
+      gap: calc(8px * var(--preview-density, 1));
+      min-height: var(--preview-avatar-height, 84px);
+      margin-top: 10px;
+      padding: calc(9px * var(--preview-density, 1));
+      border-radius: var(--preview-radius, var(--ui-radius));
+      background: var(--panel);
+      color: var(--ink);
+      font-size: calc(13px * var(--preview-font-scale, 1));
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--line) 68%, transparent);
+    }
+    .theme-preview-side,
+    .theme-preview-main {
+      min-width: 0;
+      border-radius: max(4px, calc(var(--preview-radius, var(--ui-radius)) - 2px));
+      background: var(--panel-soft);
+    }
+    .theme-preview-side { display: grid; gap: 6px; padding: 8px; align-content: start; }
+    .theme-preview-side i,
+    .theme-preview-line {
+      display: block;
+      height: 7px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--muted) 26%, transparent);
+    }
+    .theme-preview-side i:first-child { background: var(--accent); }
+    .theme-preview-main { display: grid; gap: 8px; padding: 9px; align-content: center; }
+    .theme-preview-line.strong { width: 64%; height: 10px; background: var(--ink); }
+    .theme-preview-line.accent { width: 46%; background: var(--accent); }
     .settings-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
     .settings-note { font-size: 13px; color: var(--muted); line-height: 1.55; margin: 8px 0; overflow-wrap: anywhere; }
     .settings-page { display: none; }
@@ -6870,22 +9238,23 @@ INDEX_HTML = r"""<!doctype html>
       color: #ffffff;
     }
     .settings-clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-    #sec-audit, #sec-remote-llm, #sec-ai-plugin { grid-column: 1 / -1; }
+    #sec-audit, #sec-remote-llm, #sec-ai-plugin,
+    #sec-display, #sec-update { grid-column: 1 / -1; }
+    #sec-display, #sec-update { order: 10; }
     #sec-audit > div[style*="grid-template-columns"],
     #sec-remote-llm > div[style*="grid-template-columns"] { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)) !important; }
     #sec-ai-plugin textarea { min-height: 160px; font-family: Consolas, "Cascadia Mono", monospace; }
-    @media (min-width: 1200px) {
-      .settings-grid { grid-template-columns: repeat(3, 1fr); }
-    }
-    @media (min-width: 761px) and (max-width: 1199px) {
-      .settings-grid { grid-template-columns: repeat(2, 1fr); }
-    }
     @media (max-width: 760px) {
       .settings-overlay { padding: 10px; }
       .settings-panel { width: calc(100vw - 20px); max-height: calc(100vh - 20px); }
       .settings-header { padding: 16px 18px 12px; }
-      .settings-grid { padding: 14px 18px 18px; grid-template-columns: 1fr; gap: 12px; }
-      #sec-audit, #sec-remote-llm, #sec-ai-plugin { grid-column: auto; }
+      .settings-grid { grid-template-columns: 1fr; overflow: auto; }
+      .settings-category-nav { display: flex; gap: 8px; overflow-x: auto; padding: 10px 14px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .settings-category-group { display: contents; margin: 0; }
+      .settings-category-label { display: none; }
+      .settings-category-button { flex: 0 0 auto; width: auto; padding: 0 12px; background: var(--panel); }
+      .settings-category-button.active::before { display: none; }
+      .settings-content { overflow: visible; padding: 14px 18px 18px; gap: 12px; }
       #sec-audit > div[style*="grid-template-columns"],
       #sec-remote-llm > div[style*="grid-template-columns"] { grid-template-columns: 1fr !important; }
       .settings-control-grid { grid-template-columns: 1fr; }
@@ -6975,25 +9344,24 @@ INDEX_HTML = r"""<!doctype html>
     .onboarding-panel .persona-hint:hover { background: #e8edf5; border-color: #276ef1; }
     .onboarding-panel .persona-note { margin-top: 6px; font-size: 12px; color: #657184; line-height: 1.5; }
     /* Guided tour overlay */
-    .tour-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 5000; display: flex; align-items: center; justify-content: center; }
+    .tour-overlay { position: fixed; inset: 0; z-index: 5000; pointer-events: none; }
     .tour-overlay.hidden { display: none; }
-    .tour-highlight { position: absolute; border-radius: 12px; box-shadow: 0 0 0 9999px rgba(0,0,0,.7); z-index: 1; }
-    .tour-tooltip { position: relative; z-index: 2; background: #fff; border-radius: 12px; padding: 20px 24px; max-width: 340px; box-shadow: 0 12px 48px rgba(0,0,0,.3); }
-    .tour-tooltip::before { content: ''; position: absolute; width: 0; height: 0; border: 8px solid transparent; }
-    .tour-tooltip.top::before { bottom: -16px; left: 50%; transform: translateX(-50%); border-top-color: #fff; }
-    .tour-tooltip.bottom::before { top: -16px; left: 50%; transform: translateX(-50%); border-bottom-color: #fff; }
-    .tour-tooltip.left::before { right: -16px; top: 50%; transform: translateY(-50%); border-left-color: #fff; }
-    .tour-tooltip.right::before { left: -16px; top: 50%; transform: translateY(-50%); border-right-color: #fff; }
-    .tour-tooltip h3 { margin: 0 0 8px; font-size: 18px; color: #1c2430; }
-    .tour-tooltip p { margin: 0 0 16px; font-size: 14px; color: #657184; line-height: 1.5; }
-    .tour-progress { display: flex; gap: 6px; margin-bottom: 16px; }
-    .tour-dot { width: 8px; height: 8px; border-radius: 50%; background: #d9dee7; transition: background .3s; }
-    .tour-dot.active { background: #276ef1; }
-    .tour-actions { display: flex; justify-content: flex-end; gap: 10px; }
-    .tour-actions button { padding: 8px 20px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: 0; }
-    .tour-actions .tour-skip { background: #e8edf5; color: #263244; }
-    .tour-actions .tour-next { background: #276ef1; color: #fff; }
-    .tour-actions .tour-next:hover { background: #1e5bd6; }
+    .tour-highlight { position: fixed; display: none; border: 2px solid var(--accent); border-radius: 10px; box-shadow: 0 0 0 9999px rgba(12, 18, 28, .68), 0 0 0 5px rgba(39, 110, 241, .2); pointer-events: none; transition: left .18s ease, top .18s ease, width .18s ease, height .18s ease; }
+    .tour-tooltip { position: fixed; z-index: 2; width: min(360px, calc(100vw - 32px)); padding: 18px; border: 1px solid rgba(24, 36, 52, .12); border-radius: 8px; background: var(--panel); color: var(--ink); box-shadow: 0 18px 50px rgba(12, 18, 28, .28); pointer-events: auto; }
+    .tour-kicker { margin: 0 0 8px; color: var(--accent); font-size: 12px; font-weight: 750; }
+    .tour-tooltip h3 { margin: 0 0 8px; font-size: 18px; line-height: 1.25; }
+    .tour-tooltip p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.6; }
+    .tour-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; }
+    .tour-progress { display: flex; gap: 5px; }
+    .tour-dot { width: 6px; height: 6px; border-radius: 50%; background: color-mix(in srgb, var(--ink) 18%, transparent); }
+    .tour-dot.active { width: 20px; border-radius: 4px; background: var(--accent); }
+    .tour-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+    .tour-actions button { min-width: 0; height: 34px; padding: 0 12px; border: 0; border-radius: 6px; font-size: 13px; font-weight: 700; cursor: pointer; }
+    .tour-actions .tour-skip, .tour-actions .tour-prev { background: transparent; color: var(--muted); }
+    .tour-actions .tour-prev[disabled] { visibility: hidden; }
+    .tour-actions .tour-next { background: var(--accent); color: #fff; }
+    .tour-actions .tour-next:hover { background: color-mix(in srgb, var(--accent) 86%, #000); }
+    @media (max-width: 760px) { .tour-tooltip { left: 16px !important; right: 16px; bottom: 16px; top: auto !important; width: auto; } .tour-highlight { border-radius: 8px; } }
     /* Privacy consent modal */
     .privacy-overlay { position: fixed; inset: 0; z-index: 3000; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(17, 24, 39, .62); }
     .privacy-overlay.hidden { display: none; }
@@ -7011,6 +9379,136 @@ INDEX_HTML = r"""<!doctype html>
     .privacy-check input { width: auto; margin-top: 3px; flex: 0 0 auto; }
     .privacy-submit { margin-top: 14px; width: 100%; height: 44px; border-radius: 8px; }
     .privacy-submit:disabled { cursor: not-allowed; opacity: .5; }
+
+    /* Keep the display controls effective where legacy component rules use fixed values. */
+    body :is(
+      button:not(.settings-btn, .settings-close, .attach-btn, .voice-btn, .realtime-voice-btn, .wake-word-btn, #send),
+      input:not([type="range"], [type="radio"], [type="checkbox"], [type="color"]),
+      textarea:not(#message),
+      select,
+      .msg,
+      .notice,
+      .files summary,
+      .file-card,
+      .memory-orbit,
+      .memory-node,
+      .realtime-pet-chat,
+      .realtime-pet-line,
+      .learning-record,
+      .emotion-meta,
+      .emotion-toggle,
+      .msg.user,
+      .new-chat-btn,
+      .recent-chat,
+      .secondary-nav a,
+      .companion-visual-tabs,
+      .companion-visual-tabs button,
+      .preview,
+      .companion-visual-stage,
+      .voice-input-row,
+      .composer-resources,
+      .realtime-options > div,
+      .settings-panel,
+      .settings-section,
+      .settings-category-button,
+      .settings-slider,
+      .theme-option,
+      .custom-theme-grid,
+      .theme-preview,
+      .display-summary-item,
+      .display-theme-entry,
+      .update-summary-item,
+      .update-release-card,
+      .update-log-body,
+      .correct-panel,
+      .onboarding-panel,
+      .tour-highlight,
+      .tour-tooltip,
+      .privacy-panel
+    ) {
+      border-radius: var(--ui-radius) !important;
+    }
+    /* Composer shell tracks radius; nested controls stay quieter so large radius does not occlude tools. */
+    body .voice-input-row textarea,
+    body .voice-input-row #message {
+      border-radius: 0 !important;
+    }
+    body .voice-input-row button,
+    body .voice-input-row #send,
+    body .voice-input-row .attach-btn,
+    body .voice-input-row .voice-btn,
+    body .voice-input-row .realtime-voice-btn,
+    body .voice-input-row .wake-word-btn {
+      border-radius: max(4px, min(12px, calc(var(--ui-radius) - 10px))) !important;
+    }
+    /* The compact desktop workspace must still honor the display controls. */
+    @media (min-width: 761px) {
+      body { grid-template-columns: var(--sidebar-width) minmax(0, 1fr); }
+      .chat-nav { display: grid; gap: 4px; margin: 0 0 24px; }
+      .chat-nav a {
+        display: flex;
+        align-items: center;
+        min-height: 42px;
+        padding: 0 12px;
+        border-radius: var(--ui-radius);
+        color: var(--muted);
+        font-size: 14px;
+        font-weight: 500;
+        text-decoration: none;
+      }
+      .chat-nav a.active {
+        background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+        color: var(--accent);
+        font-weight: 750;
+      }
+      .chat-nav a.active::before {
+        content: "";
+        width: 12px;
+        height: 12px;
+        margin-right: 10px;
+        border-radius: 50%;
+        background: var(--accent);
+      }
+      main { grid-template-rows: 68px minmax(0, 1fr) auto auto; }
+      .avatar-stage { display: none !important; }
+      #chat { grid-row: 2; }
+      form { grid-row: 3; }
+      .suggestions-panel { grid-row: 4; }
+      .context-rail { grid-row: 2 / 5; }
+    }
+
+    /* Assistant messages keep their metadata close to the content. */
+    .msg.assistant {
+      grid-template-columns: 32px minmax(0, 1fr);
+      column-gap: 10px;
+      row-gap: 3px;
+      padding: 8px 0;
+    }
+    .msg.assistant::before,
+    #welcome-message::before {
+      width: 32px;
+      height: 32px;
+      grid-column: 1;
+      grid-row: 1;
+    }
+    .assistant-meta {
+      grid-column: 2;
+      grid-row: 1;
+      align-self: center;
+    }
+    .msg.assistant .msg-body,
+    #welcome-message .msg-body {
+      grid-column: 2;
+      grid-row: 2;
+      margin: 0;
+      gap: 4px;
+    }
+    #welcome-message {
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr);
+      margin-top: 16px;
+      align-items: start;
+    }
   </style>
 </head>
 <body>
@@ -7081,6 +9579,11 @@ INDEX_HTML = r"""<!doctype html>
           <option value="guardian">守护者：关心作息和状态</option>
           <option value="lifeform">虚拟生命：从空白程序形成独特痕迹</option>
           <option value="custom">自定义关系</option>
+        </select>
+      </div>
+      <div class="form-group" id="ob-relationship-subtype-group" style="display: none;">
+        <label><span id="ob-relationship-subtype-label">具体身份</span> <span class="optional">（必选）</span></label>
+        <select id="ob-relationship-subtype">
         </select>
       </div>
       <div class="form-group" id="ob-romance-evolution-group">
@@ -7154,13 +9657,17 @@ INDEX_HTML = r"""<!doctype html>
   <!-- Guided Tour Overlay -->
   <div class="tour-overlay hidden" id="tour-overlay">
     <div class="tour-highlight" id="tour-highlight"></div>
-    <div class="tour-tooltip" id="tour-tooltip">
-      <h3 id="tour-title">欢迎引导</h3>
-      <p id="tour-desc">这里是引导内容</p>
-      <div class="tour-progress" id="tour-progress"></div>
-      <div class="tour-actions">
-        <button type="button" class="tour-skip" id="tour-skip">跳过引导</button>
-        <button type="button" class="tour-next" id="tour-next">下一步</button>
+    <div class="tour-tooltip" id="tour-tooltip" role="dialog" aria-modal="true" aria-labelledby="tour-title">
+      <p class="tour-kicker" id="tour-kicker">开始使用</p>
+      <h3 id="tour-title">欢迎</h3>
+      <p id="tour-desc"></p>
+      <div class="tour-footer">
+        <div class="tour-progress" id="tour-progress" aria-label="引导进度"></div>
+        <div class="tour-actions">
+          <button type="button" class="tour-skip" id="tour-skip">跳过</button>
+          <button type="button" class="tour-prev" id="tour-prev">上一步</button>
+          <button type="button" class="tour-next" id="tour-next">下一步</button>
+        </div>
       </div>
     </div>
   </div>
@@ -7182,39 +9689,23 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <aside>
-    <p class="memory-title" data-i18n="memory_title">长期记忆</p>
-    <div class="memory-orbit" id="memory-orbit" tabindex="0" aria-label="靠近查看 AI 的记忆" data-i18n-aria="memory_orbit_label">
-      <svg class="memory-brain" viewBox="0 0 160 132" aria-hidden="true">
-        <path d="M67 105c-20 0-36-15-36-34 0-8 3-16 8-22-1-22 15-37 34-33 8-12 27-9 32 5 16-1 29 11 29 27 9 6 14 17 11 30-3 17-18 27-36 27H67Z" />
-        <path d="M74 18c-10 13-9 27 0 38-10 8-11 22-2 32" />
-        <path d="M104 23c-6 10-5 22 3 30-11 5-15 16-10 29" />
-        <path d="M42 51c13-4 25-2 34 7" />
-        <path d="M88 56c18-8 34-5 45 8" />
-        <path d="M51 80c13 7 29 9 47 2" />
-        <circle cx="52" cy="50" r="4" />
-        <circle cx="104" cy="54" r="4" />
-        <circle cx="73" cy="86" r="4" />
-        <circle cx="122" cy="78" r="4" />
-      </svg>
-      <div id="memory-nodes" aria-live="polite"></div>
-      <div class="memory-orbit-hint" data-i18n="memory_orbit_hint">靠近大脑，查看 AI 正在记住什么</div>
+    <div class="sidebar-brand">
+      <img class="sidebar-brand-mark" src="/asset/ai_icon.ico" alt="">
+      <strong>Companion AI</strong>
     </div>
-    <div id="memory" class="memory" data-i18n="memory_loading">加载中...</div>
-    <div id="growth-summary" class="growth-panel">
-      <h4>关系成长</h4>
-      <div class="growth-row"><span>关系</span><strong>加载中...</strong></div>
-    </div>
-    <details class="files">
-      <summary id="files-summary">文件：暂无</summary>
-      <div id="files" class="files-body"></div>
-    </details>
+    <button type="button" class="new-chat-btn" id="new-chat-btn">+ 新建对话</button>
+    <p class="sidebar-section-label" data-i18n="function_area">功能区</p>
     <nav class="secondary-nav" aria-label="二级功能页面">
       <a href="/diary">情绪与日记</a>
       <a href="/samples">训练样本</a>
       <a href="/moments_page">AI朋友圈</a>
       <a href="/tools">学习与工具</a>
     </nav>
-    <details class="command-section" open>
+    <p class="sidebar-section-label">最近对话</p>
+    <div class="recent-chat-list" id="recent-chat-list" aria-label="最近对话">
+      <div class="recent-chat-empty">暂无最近对话</div>
+    </div>
+    <details class="command-section">
       <summary data-i18n="quick_core">常用入口</summary>
       <div class="quick">
         <button type="button" data-fill="/chat_status">系统状态</button>
@@ -7225,18 +9716,12 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </details>
     <div id="plugin-buttons" class="quick"><!--PLUGIN_BUTTONS--></div>
-    <details class="plugin-mgr">
-      <summary data-i18n="plugin_management">插件管理</summary>
-      <div id="plugin-list" data-i18n="plugins_loading">加载中...</div>
-      <button type="button" id="plugin-reload-btn" style="margin-top:6px" data-i18n="refresh_plugins">刷新插件</button>
-      <button type="button" id="plugin-new-btn" style="margin-top:6px;margin-left:6px" data-i18n="new_plugin">新建插件</button>
-    </details>
     <div style="margin:6px 0"><a href="/live2d" target="_blank" class="live2d-viewer-link" data-i18n="live2d_viewer">Live2D 查看器</a></div>
     <div class="notice" data-i18n="web_notice">只读取你有权访问的网页。不会绕过登录、付费墙、验证码、权限控制或反爬限制。</div>
   </aside>
   <main>
     <header style="position:relative">
-      <h1 data-i18n="app_name">AI陪伴桌宠</h1>
+      <h1>新对话</h1>
       <div class="header-tools">
         <div class="status" id="status" data-i18n="app_subtitle">本地运行 · 记忆自训练</div>
         <select class="language-select" id="language-select" aria-label="语言">
@@ -7246,6 +9731,44 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <button class="settings-btn" id="settings-btn" title="设置" data-i18n-title="settings">&#x2699;</button>
     </header>
+    <section class="context-rail">
+      <details class="sidebar-context" open>
+        <summary>本次对话</summary>
+        <div class="sidebar-context-body">
+          <p class="memory-title">正在使用</p>
+          <div class="memory-orbit" id="memory-orbit" tabindex="0" aria-label="靠近查看 AI 的记忆" data-i18n-aria="memory_orbit_label">
+            <svg class="memory-brain" viewBox="0 0 160 132" aria-hidden="true">
+              <path d="M67 105c-20 0-36-15-36-34 0-8 3-16 8-22-1-22 15-37 34-33 8-12 27-9 32 5 16-1 29 11 29 27 9 6 14 17 11 30-3 17-18 27-36 27H67Z" />
+              <path d="M74 18c-10 13-9 27 0 38-10 8-11 22-2 32" />
+              <path d="M104 23c-6 10-5 22 3 30-11 5-15 16-10 29" />
+              <path d="M42 51c13-4 25-2 34 7" /><path d="M88 56c18-8 34-5 45 8" /><path d="M51 80c13 7 29 9 47 2" />
+              <circle cx="52" cy="50" r="4" /><circle cx="104" cy="54" r="4" /><circle cx="73" cy="86" r="4" /><circle cx="122" cy="78" r="4" />
+            </svg>
+            <div id="memory-nodes" aria-live="polite"></div>
+            <div class="memory-orbit-hint" data-i18n="memory_orbit_hint">靠近大脑，查看 AI 正在记住什么</div>
+          </div>
+          <div id="memory" class="memory" data-i18n="memory_loading">加载中...</div>
+          <div id="growth-summary" class="growth-panel"><h4>关系成长</h4><div class="growth-row"><span>关系</span><strong>加载中...</strong></div></div>
+          <details class="files"><summary id="files-summary">文件：暂无</summary><div id="files" class="files-body"></div></details>
+          <div class="context-shortcuts" aria-label="快捷开始">
+            <p class="memory-title">快捷开始</p>
+            <button type="button" data-context-fill="帮我拆解一项任务">帮我拆解一项任务</button>
+            <button type="button" data-context-fill="/context">总结刚才的对话</button>
+            <button type="button" data-context-fill="/see_screen">观察当前屏幕</button>
+          </div>
+        </div>
+      </details>
+      <section class="companion-visual" aria-label="伙伴展示">
+        <div class="companion-visual-tabs" role="tablist" aria-label="展示模式">
+          <button type="button" class="active" data-companion-view="live2d" role="tab" aria-selected="true">Live2D</button>
+          <button type="button" data-companion-view="live3d" role="tab" aria-selected="false">Live3D</button>
+        </div>
+        <div class="companion-visual-stage">
+          <iframe id="live2dFrame" class="live2d-frame" title="Live2D avatar" src="about:blank"></iframe>
+          <iframe id="live3dFrame" class="live3d-frame" title="Live3D avatar" src="/3d?embed=1" hidden></iframe>
+        </div>
+      </section>
+    </section>
     <section class="avatar-stage">
       <div id="avatar" class="avatar idle" aria-label="Live2D avatar placeholder">
         <div class="hair"></div>
@@ -7255,7 +9778,6 @@ INDEX_HTML = r"""<!doctype html>
         <div class="eye right"></div>
         <div class="mouth"></div>
       </div>
-      <iframe id="live2dFrame" class="live2d-frame" title="Live2D avatar" src="about:blank"></iframe>
       <div class="avatar-info">
         <div id="avatarStatus" data-i18n="classic_avatar_status">Live2D 区域：内置 2D 头像 · 动作学习中</div>
         <div id="motionList" class="motion-list"></div>
@@ -7266,39 +9788,53 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </section>
     <section id="chat">
-      <div class="msg assistant" id="welcome-message" data-i18n="welcome_message">我在。可以直接聊天、上传文件、读取网页 URL，也可以用下面的提示词快速开始。
+      <div class="msg assistant" id="welcome-message">
+        <div class="assistant-meta"><strong>Companion</strong><span>10:24</span></div>
+        <div class="msg-body"><div class="msg-text" data-i18n="welcome_message">我在。可以直接聊天、上传文件、读取网页 URL，也可以用下面的提示词快速开始。
 
-日记、朋友圈、学习训练和管理工具已经移到左侧二级页面入口，聊天页只保留高频操作。</div>
+日记、朋友圈、学习训练和管理工具已经移到左侧二级页面入口，聊天页只保留高频操作。</div></div>
+      </div>
     </section>
     <form id="form">
       <div class="inputs">
-        <input id="url" placeholder="可选：网页 URL" data-i18n-placeholder="url_placeholder" />
-        <input id="file" type="file" />
         <div class="voice-input-row">
           <textarea id="message" placeholder="和我说点什么..." data-i18n-placeholder="message_placeholder"></textarea>
+          <button id="attach-btn" class="attach-btn" type="button" title="发送文件/图片" aria-label="发送文件/图片">📎</button>
           <button id="voice-input-btn" class="voice-btn" type="button" title="语音输入" aria-label="语音输入">🎙</button>
           <button id="realtime-voice-btn" class="realtime-voice-btn" type="button" title="开启实时对话" aria-label="开启实时对话" data-i18n-title="realtime_start" data-i18n-aria="realtime_start">◉</button>
           <button id="wake-word-btn" class="wake-word-btn" type="button" title="开启语音唤醒" aria-label="开启语音唤醒" data-i18n-title="wake_word_start" data-i18n-aria="wake_word_start">⚡</button>
+          <button id="send" type="submit" data-i18n="send">发送</button>
         </div>
-        <div id="realtime-voice-status" class="realtime-voice-status" aria-live="polite"></div>
-        <div class="realtime-sense-row" aria-label="实时对话叠加感知">
-          <label class="realtime-sense-toggle" title="每句实时对话前观察一次当前屏幕">
-            <input id="realtime-screen-toggle" type="checkbox" />
-            <span>屏幕</span>
-          </label>
-          <label class="realtime-sense-toggle" title="每句实时对话前从摄像头抓拍一帧并做物体/场景识别">
-            <input id="realtime-camera-toggle" type="checkbox" />
-            <span>摄像头</span>
-          </label>
-          <label class="realtime-sense-toggle" title="每句实时对话前尝试识别人脸身份">
-            <input id="realtime-face-toggle" type="checkbox" />
-            <span>人物</span>
-          </label>
-        </div>
+        <details class="composer-tools" id="composer-tools">
+          <summary data-i18n="composer_tools">附件、网页与更多</summary>
+          <div class="composer-resources">
+            <input id="url" placeholder="可选：网页 URL" data-i18n-placeholder="url_placeholder" />
+            <input id="file" type="file" accept="image/*,.pdf,.txt,.md,.doc,.docx,.csv,.json,.zip" />
+          </div>
+        </details>
+        <details class="realtime-options">
+          <summary data-i18n="realtime_options">实时对话选项</summary>
+          <div id="realtime-voice-status" class="realtime-voice-status" aria-live="polite"></div>
+          <div class="realtime-sense-row" aria-label="实时对话叠加感知">
+            <label class="realtime-sense-toggle" title="每句实时对话前观察一次当前屏幕">
+              <input id="realtime-screen-toggle" type="checkbox" />
+              <span>屏幕</span>
+            </label>
+            <label class="realtime-sense-toggle" title="每句实时对话前从摄像头抓拍一帧并做物体/场景识别">
+              <input id="realtime-camera-toggle" type="checkbox" />
+              <span>摄像头</span>
+            </label>
+            <label class="realtime-sense-toggle" title="每句实时对话前尝试识别人脸身份">
+              <input id="realtime-face-toggle" type="checkbox" />
+              <span>人物</span>
+            </label>
+          </div>
+        </details>
       </div>
-      <button id="send" type="submit" data-i18n="send">发送</button>
     </form>
-    <div class="suggestions" id="suggestions">
+    <details class="suggestions-panel">
+      <summary data-i18n="quick_core">常用入口</summary>
+      <div class="suggestions" id="suggestions">
       <span class="suggestion-chip" data-fill="/chat_status">系统状态</span>
       <span class="suggestion-chip" data-fill="/accelerate">培养加速</span>
       <span class="suggestion-chip" data-fill="/see_screen">观察屏幕</span>
@@ -7307,7 +9843,8 @@ INDEX_HTML = r"""<!doctype html>
       <span class="suggestion-chip" data-fill="/teach 当我说我很累 => 先安静陪我一下，再帮我把事情拆成一个很小的下一步。" data-command-key="teach_example">教一句</span>
       <span class="suggestion-chip" data-fill="/remember 我希望你回答时先给结论，再给步骤。" data-command-key="remember_example">写入偏好</span>
       <span class="suggestion-chip" data-fill="我今天有点累，陪我整理一下思路。" data-command-key="chat_example">随便聊聊</span>
-    </div>
+      </div>
+    </details>
   </main>
   <script>
     let i18nState = __I18N_BOOTSTRAP__;
@@ -7322,6 +9859,11 @@ INDEX_HTML = r"""<!doctype html>
         chinese: "中文",
         english: "English",
         memory_title: "长期记忆",
+        chat_workspace: "对话",
+        function_area: "功能区",
+        context_title: "长期记忆与上下文",
+        composer_tools: "附件、网页与更多",
+        realtime_options: "实时对话选项",
         memory_loading: "加载中...",
         training_loading: "训练样本：加载中...",
         files_empty: "文件：暂无",
@@ -7369,8 +9911,8 @@ INDEX_HTML = r"""<!doctype html>
       font_scale: 100,
       density: 100,
       radius: 8,
-      sidebar_width: 320,
-      avatar_height: 170,
+      sidebar_width: 280,
+      avatar_height: 84,
       custom: {
         bg: "#f6f7f9",
         panel: "#ffffff",
@@ -7411,7 +9953,7 @@ INDEX_HTML = r"""<!doctype html>
       next.density = clamp(next.density, 80, 125, displayDefaults.density);
       next.radius = clamp(next.radius, 2, 18, displayDefaults.radius);
       next.sidebar_width = clamp(next.sidebar_width, 240, 440, displayDefaults.sidebar_width);
-      next.avatar_height = clamp(next.avatar_height, 130, 260, displayDefaults.avatar_height);
+      next.avatar_height = clamp(next.avatar_height, 64, 104, displayDefaults.avatar_height);
       next.custom = {...displayDefaults.custom, ...((config && config.custom) || {})};
       Object.keys(displayDefaults.custom).forEach(key => {
         if (!isHex(next.custom[key])) next.custom[key] = displayDefaults.custom[key];
@@ -7444,6 +9986,7 @@ INDEX_HTML = r"""<!doctype html>
       } else {
         root.style.removeProperty("--paper");
       }
+      applyDisplayTypography(displayConfig.font_scale);
       syncDisplayControls();
     }
 
@@ -7467,6 +10010,45 @@ INDEX_HTML = r"""<!doctype html>
           accent_2: customValue("custom-accent-2")
         }
       });
+    }
+
+    function updateRangeVisual(input) {
+      if (!input || input.type !== "range") return;
+      const min = parseFloat(input.min || "0");
+      const max = parseFloat(input.max || "100");
+      const value = parseFloat(input.value || "0");
+      const pct = max > min ? ((value - min) / (max - min)) * 100 : 0;
+      input.style.setProperty("--slider-progress", `${Math.max(0, Math.min(100, pct))}%`);
+    }
+
+    function applyDisplayTypography(fontScale) {
+      const scale = Number(fontScale) / 100;
+      if (!Number.isFinite(scale) || !document.body) return;
+      const selector = [
+        "h1", "h2", "h3", "h4", "p", "span", "a", "button", "label", "summary",
+        "strong", "em", "li", "input", "textarea", "select", "option", ".status", ".memory"
+      ].join(",");
+      document.body.querySelectorAll(selector).forEach(element => {
+        const currentSize = parseFloat(getComputedStyle(element).fontSize);
+        if (!Number.isFinite(currentSize) || currentSize <= 0) return;
+        if (!element.dataset.displayFontBase) {
+          // The initial view may already be scaled by a saved setting.
+          element.dataset.displayFontBase = String(currentSize / scale);
+        }
+        const baseSize = parseFloat(element.dataset.displayFontBase);
+        if (Number.isFinite(baseSize)) element.style.fontSize = `${(baseSize * scale).toFixed(2)}px`;
+      });
+    }
+
+    function updateDisplayPreview(cfg) {
+      const preview = document.getElementById("display-preview-surface");
+      if (!preview) return;
+      const normalized = normalizedDisplayConfig(cfg);
+      preview.style.setProperty("--preview-font-scale", (normalized.font_scale / 100).toFixed(2));
+      preview.style.setProperty("--preview-density", (normalized.density / 100).toFixed(2));
+      preview.style.setProperty("--preview-radius", normalized.radius + "px");
+      preview.style.setProperty("--preview-sidebar-width", Math.round(42 + ((normalized.sidebar_width - 240) / 200) * 70) + "px");
+      preview.style.setProperty("--preview-avatar-height", Math.round(64 + ((normalized.avatar_height - 64) / 40) * 54) + "px");
     }
 
     function syncDisplayControls() {
@@ -7496,9 +10078,13 @@ INDEX_HTML = r"""<!doctype html>
       pairs.forEach(([inputId, valueId, value, unit]) => {
         const input = document.getElementById(inputId);
         const label = document.getElementById(valueId);
-        if (input) input.value = value;
+        if (input) {
+          input.value = value;
+          updateRangeVisual(input);
+        }
         if (label) label.textContent = value + unit;
       });
+      updateDisplayPreview(cfg);
       renderDisplaySummary(cfg);
     }
 
@@ -7530,6 +10116,11 @@ INDEX_HTML = r"""<!doctype html>
       if (!mainPage || !detailPage) return;
       mainPage.classList.toggle("active", page !== "detail");
       detailPage.classList.toggle("active", page === "detail");
+      if (page === "detail") {
+        showSettingsSecondaryPage("sec-display");
+      } else {
+        showSettingsCategory(activeSettingsCategory);
+      }
     }
 
     function loadDisplaySettings() {
@@ -7589,12 +10180,15 @@ INDEX_HTML = r"""<!doctype html>
 
     const chat = document.querySelector("#chat");
     const form = document.querySelector("#form");
+    const pageTitle = document.querySelector("h1");
     const message = document.querySelector("#message");
     const url = document.querySelector("#url");
     const send = document.querySelector("#send");
     const voiceInputBtn = document.querySelector("#voice-input-btn");
     const realtimeVoiceBtn = document.querySelector("#realtime-voice-btn");
     const wakeWordBtn = document.querySelector("#wake-word-btn");
+    const newChatBtn = document.querySelector("#new-chat-btn");
+    const recentChatList = document.querySelector("#recent-chat-list");
     const realtimeVoiceStatus = document.querySelector("#realtime-voice-status");
     const realtimePetChat = document.querySelector("#realtime-pet-chat");
     const realtimePetChatBody = document.querySelector("#realtime-pet-chat-body");
@@ -7613,14 +10207,75 @@ INDEX_HTML = r"""<!doctype html>
     const training = document.querySelector("#training");
     const files = document.querySelector("#files");
     const momentsList = document.querySelector("#moments-list");
+    
+    // Multimodal emotion metrics collector
+    let typingMetrics = {
+        backspaces: 0,
+        pauses: 0,
+        lastKeyTime: 0,
+        keyCount: 0,
+        totalDuration: 0,
+        startTypingTime: 0
+    };
+    
+    function resetTypingMetrics() {
+        typingMetrics = { backspaces: 0, pauses: 0, lastKeyTime: 0, keyCount: 0, totalDuration: 0, startTypingTime: 0 };
+    }
+    
+    function countPunctuation(text) {
+        const exclamation = (text.match(/[！!]/g) || []).length;
+        const ellipsis = (text.match(/[………]/g) || []).length + 0.5 * (text.match(/\.\.\./g) || []).length;
+        const question = (text.match(/[？?]/g) || []).length;
+        return { exclamation, ellipsis, question, total: text.length };
+    }
+    
+    if (message) {
+        message.addEventListener("keydown", e => {
+            const now = performance.now();
+            if (typingMetrics.startTypingTime === 0) {
+                typingMetrics.startTypingTime = now;
+            }
+            if (e.key === "Backspace" || e.key === "Delete") {
+                typingMetrics.backspaces++;
+            }
+            if (typingMetrics.lastKeyTime && now - typingMetrics.lastKeyTime > 1500) {
+                typingMetrics.pauses++;
+            }
+            typingMetrics.lastKeyTime = now;
+            typingMetrics.keyCount++;
+            typingMetrics.totalDuration = now - typingMetrics.startTypingTime;
+        });
+        
+        message.addEventListener("input", () => {
+            if (typingMetrics.startTypingTime === 0) {
+                typingMetrics.startTypingTime = performance.now();
+            }
+            typingMetrics.totalDuration = performance.now() - typingMetrics.startTypingTime;
+        });
+    }
     const momentInput = document.querySelector("#moment-input");
     const momentPostBtn = document.querySelector("#moment-post-btn");
     const momentGenerateBtn = document.querySelector("#moment-generate-btn");
     const fileInput = document.querySelector("#file");
+    const attachBtn = document.querySelector("#attach-btn");
+    const composerTools = document.querySelector("#composer-tools");
+    function updateAttachButton() {
+      if (!attachBtn || !fileInput) return;
+      const hasFile = !!(fileInput.files && fileInput.files.length);
+      attachBtn.classList.toggle("has-file", hasFile);
+      attachBtn.title = hasFile ? (`已选择：${fileInput.files[0].name}`) : "发送文件/图片";
+      attachBtn.setAttribute("aria-label", attachBtn.title);
+    }
+    attachBtn?.addEventListener("click", () => {
+      if (composerTools) composerTools.open = true;
+      fileInput?.click();
+    });
+    fileInput?.addEventListener("change", updateAttachButton);
     const status = document.querySelector("#status");
     const avatar = document.querySelector("#avatar");
     const avatarStage = document.querySelector(".avatar-stage");
     const live2dFrame = document.querySelector("#live2dFrame");
+    const live3dFrame = document.querySelector("#live3dFrame");
     const avatarStatus = document.querySelector("#avatarStatus");
     const motionList = document.querySelector("#motionList");
     const privacyOverlay = document.querySelector("#privacy-overlay");
@@ -7631,6 +10286,8 @@ INDEX_HTML = r"""<!doctype html>
     let lastAssistantText = "";
     let lastEmotion = null;
     let currentFileId = "";
+    let currentConversationId = "";
+    let recentChats = [];
     let ttsConfig = { enabled: false, auto_play: false };
     let currentAudio = null;
     let currentAudioControl = null;
@@ -7649,6 +10306,66 @@ INDEX_HTML = r"""<!doctype html>
     let lastFilesData = null;
     let lastAvatarData = null;
     applyI18n();
+    document.querySelectorAll(".command-section, .suggestions-panel").forEach(panel => {
+      panel.open = false;
+    });
+    document.querySelectorAll("[data-companion-view]").forEach(button => {
+      button.addEventListener("click", () => {
+        const view = button.dataset.companionView;
+        const showLive2d = view === "live2d";
+        if (live2dFrame) live2dFrame.hidden = !showLive2d;
+        if (live3dFrame) {
+          live3dFrame.hidden = showLive2d;
+          if (!showLive2d) {
+            const wanted = "/3d?embed=1";
+            if (!String(live3dFrame.src || "").includes("/3d?embed=1")) live3dFrame.src = wanted;
+          }
+        }
+        document.querySelectorAll("[data-companion-view]").forEach(tab => {
+          const active = tab === button;
+          tab.classList.toggle("active", active);
+          tab.setAttribute("aria-selected", String(active));
+        });
+        broadcastCompanionCursor();
+      });
+    });
+
+    let lastCompanionCursor = null;
+    function activeCompanionFrame() {
+      if (live2dFrame && !live2dFrame.hidden) return live2dFrame;
+      if (live3dFrame && !live3dFrame.hidden) return live3dFrame;
+      return null;
+    }
+
+    function broadcastCompanionCursor(event = null) {
+      const frame = activeCompanionFrame();
+      if (!frame || !frame.contentWindow) return;
+      if (event) {
+        lastCompanionCursor = {
+          x: Number.isFinite(event.screenX) ? event.screenX : window.screenX + event.clientX,
+          y: Number.isFinite(event.screenY) ? event.screenY : window.screenY + event.clientY
+        };
+      }
+      if (!lastCompanionCursor) return;
+      const rect = frame.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      frame.contentWindow.postMessage({
+        type: "cursor-position",
+        payload: {
+          cursor: lastCompanionCursor,
+          windowBounds: {
+            x: Math.round((window.screenX || window.screenLeft || 0) + rect.left),
+            y: Math.round((window.screenY || window.screenTop || 0) + rect.top),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          }
+        }
+      }, "*");
+    }
+    window.addEventListener("mousemove", broadcastCompanionCursor, { passive: true });
+    window.addEventListener("pointermove", broadcastCompanionCursor, { passive: true });
+    window.addEventListener("resize", () => broadcastCompanionCursor());
+    setInterval(() => broadcastCompanionCursor(), 80);
 
     languageSelect?.addEventListener("change", async () => {
       const locale = languageSelect.value;
@@ -8409,9 +11126,122 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
-    function addMsg(role, text) {
+    function assistantTimeLabel(value) {
+      if (!value) return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const date = new Date(Number(value) * 1000);
+      if (Number.isNaN(date.getTime())) return String(value);
+      return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+
+    function createWelcomeMessage() {
+      const welcome = document.createElement("div");
+      welcome.className = "msg assistant msg-enter";
+      welcome.id = "welcome-message";
+      const meta = document.createElement("div");
+      meta.className = "assistant-meta";
+      const name = document.createElement("strong");
+      name.textContent = "Companion";
+      const time = document.createElement("span");
+      time.textContent = assistantTimeLabel();
+      meta.append(name, time);
+      const body = document.createElement("div");
+      body.className = "msg-body";
+      const text = document.createElement("div");
+      text.className = "msg-text";
+      text.dataset.i18n = "welcome_message";
+      text.textContent = i18nText("welcome_message");
+      body.appendChild(text);
+      welcome.append(meta, body);
+      return welcome;
+    }
+
+    function resetChatView() {
+      chat.innerHTML = "";
+      chat.appendChild(createWelcomeMessage());
+      currentFileId = "";
+      lastUserText = "";
+      lastAssistantText = "";
+      lastEmotion = null;
+    }
+
+    function formatRecentTime(value) {
+      const ts = Number(value || 0) * 1000;
+      if (!ts) return "";
+      const date = new Date(ts);
+      if (Number.isNaN(date.getTime())) return "";
+      const now = new Date();
+      if (date.toDateString() === now.toDateString()) {
+        return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      }
+      return `${date.getMonth() + 1}/${date.getDate()}`;
+    }
+
+    function setConversationTitle(title) {
+      const clean = String(title || "").trim() || "新对话";
+      if (pageTitle) pageTitle.textContent = clean;
+      document.title = `${clean} - Companion AI`;
+    }
+
+    function renderRecentChats(chats, activeId = currentConversationId) {
+      recentChats = Array.isArray(chats) ? chats : [];
+      if (!recentChatList) return;
+      recentChatList.innerHTML = "";
+      if (!recentChats.length) {
+        const empty = document.createElement("div");
+        empty.className = "recent-chat-empty";
+        empty.textContent = "暂无最近对话";
+        recentChatList.appendChild(empty);
+        return;
+      }
+      recentChats.slice(0, 8).forEach(item => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = `recent-chat ${item.id === activeId ? "active" : ""}`;
+        const title = document.createElement("span");
+        title.textContent = item.title || "新对话";
+        const time = document.createElement("small");
+        time.textContent = formatRecentTime(item.updated_at) || "刚刚";
+        btn.append(title, time);
+        btn.addEventListener("click", () => openRecentChat(item.id));
+        recentChatList.appendChild(btn);
+      });
+    }
+
+    function openRecentChat(chatId) {
+      const item = recentChats.find(chat => chat.id === chatId);
+      if (!item) return;
+      currentConversationId = item.id;
+      setConversationTitle(item.title);
+      chat.innerHTML = "";
+      const messages = Array.isArray(item.messages) ? item.messages : [];
+      if (!messages.length) {
+        chat.appendChild(createWelcomeMessage());
+      } else {
+        messages.forEach(msg => addMsg(msg.role === "assistant" ? "assistant" : "user", msg.text || "", { time: msg.time, skipAutoTTS: true, animate: false }));
+      }
+      renderRecentChats(recentChats, currentConversationId);
+      message.focus();
+    }
+
+    async function loadRecentChats() {
+      try {
+        const resp = await fetch("/api/recent_chats");
+        const data = await resp.json();
+        if (data.ok) {
+          renderRecentChats(data.chats || []);
+          if (!currentConversationId && data.chats && data.chats.length) {
+            openRecentChat(data.chats[0].id);
+          }
+        }
+      } catch (_err) {
+        renderRecentChats([]);
+      }
+    }
+
+    function addMsg(role, text, options = {}) {
       const div = document.createElement("div");
       div.className = `msg ${role}`;
+      if (options.animate !== false) div.classList.add("msg-enter");
       const display = role === "assistant" ? assistantDisplayParts(text) : { answer: String(text || ""), meta: "" };
       
       if (role === "assistant") {
@@ -8430,6 +11260,16 @@ INDEX_HTML = r"""<!doctype html>
       
       const bodyDiv = document.createElement("div");
       bodyDiv.className = "msg-body";
+      if (role === "assistant") {
+        const meta = document.createElement("div");
+        meta.className = "assistant-meta";
+        const name = document.createElement("strong");
+        name.textContent = "Companion";
+        const time = document.createElement("span");
+        time.textContent = assistantTimeLabel(options.time);
+        meta.append(name, time);
+        div.appendChild(meta);
+      }
       const textDiv = document.createElement("div");
       textDiv.className = "msg-text";
       textDiv.textContent = display.answer || text;
@@ -8458,7 +11298,7 @@ INDEX_HTML = r"""<!doctype html>
       chat.scrollTop = chat.scrollHeight;
       
       // 自动播放
-      if (role === "assistant" && ttsConfig.enabled && ttsConfig.auto_play && !suppressNextAutoTTS) {
+      if (role === "assistant" && ttsConfig.enabled && ttsConfig.auto_play && !suppressNextAutoTTS && !options.skipAutoTTS) {
         setTimeout(() => playTTS(display.answer || text), 300);
       }
       suppressNextAutoTTS = false;
@@ -8899,6 +11739,97 @@ INDEX_HTML = r"""<!doctype html>
       body.className = "growth-note";
       body.textContent = hasIdentity ? (note || "") : `未设置角色；当前数值来自聊天自动成长记录，不是人设。${note || ""}`;
       panel.append(title, row1, row2, row3, body);
+    }
+
+    function renderAuditStatus(auditStatus) {
+      let el = document.getElementById("audit-indicator");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "audit-indicator";
+        el.className = "audit-indicator";
+        chat.appendChild(el);
+      }
+      if (!auditStatus.enabled) {
+        el.style.display = "none";
+        return;
+      }
+      el.style.display = "block";
+      const statusMap = {
+        processing: "🔍 对话审计中...",
+        completed: "✓ 审计完成",
+        failed: "✗ 审计失败",
+      };
+      const statusText = statusMap[auditStatus.current_status] || "";
+      if (auditStatus.current_status === "processing") {
+        el.className = "audit-indicator audit-processing";
+        el.textContent = statusText;
+      } else if (auditStatus.current_status === "completed") {
+        el.className = "audit-indicator audit-completed";
+        el.textContent = statusText;
+        setTimeout(() => {
+          if (el) el.style.display = "none";
+        }, 3000);
+      } else if (auditStatus.current_status === "failed") {
+        el.className = "audit-indicator audit-failed";
+        el.textContent = statusText;
+        setTimeout(() => {
+          if (el) el.style.display = "none";
+        }, 3000);
+      } else {
+        el.style.display = "none";
+      }
+    }
+
+    function renderAuditCorrections(corrections) {
+      if (!corrections || !corrections.length) return;
+      for (const c of corrections) {
+        const div = document.createElement("div");
+        div.className = "audit-correction";
+        const label = document.createElement("div");
+        label.className = "correction-label";
+        label.textContent = "审计修正建议";
+        div.appendChild(label);
+        const text = document.createElement("div");
+        text.className = "correction-text";
+        text.textContent = c.suggested_response || "";
+        div.appendChild(text);
+        if (c.reason || c.overall_correctness != null) {
+          const meta = document.createElement("div");
+          meta.className = "correction-meta";
+          const parts = [];
+          if (c.overall_correctness != null) parts.push("正确性: " + (c.overall_correctness * 100).toFixed(0) + "%");
+          if (c.overall_score != null) parts.push("质量: " + (c.overall_score * 100).toFixed(0) + "%");
+          if (c.reason) parts.push(c.reason);
+          meta.textContent = parts.join(" | ");
+          div.appendChild(meta);
+        }
+        chat.appendChild(div);
+      }
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function renderTaskStatus(taskStatus) {
+      if (!taskStatus || taskStatus.state === "idle") return;
+      let el = document.getElementById("task-indicator");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "task-indicator";
+        el.className = "task-indicator";
+        chat.appendChild(el);
+      }
+      el.style.display = "block";
+      if (taskStatus.state === "rebuilding") {
+        el.className = "task-indicator task-processing";
+        el.textContent = "⚙️ " + (taskStatus.message || "处理中...");
+      } else if (taskStatus.state === "done") {
+        el.className = "task-indicator task-completed";
+        el.textContent = "✓ " + (taskStatus.message || "完成");
+        setTimeout(() => { if (el) el.style.display = "none"; }, 5000);
+      } else if (taskStatus.state === "error") {
+        el.className = "task-indicator task-failed";
+        el.textContent = "✗ " + (taskStatus.message || "失败");
+        setTimeout(() => { if (el) el.style.display = "none"; }, 5000);
+      }
     }
 
     function renderEmotionChart(trend) {
@@ -9392,6 +12323,7 @@ INDEX_HTML = r"""<!doctype html>
       send.disabled = true;
       status.textContent = fromRealtime ? i18nText("realtime_thinking") : "思考中...";
       try {
+        const punctuation = countPunctuation(text);
         const resp = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -9399,11 +12331,21 @@ INDEX_HTML = r"""<!doctype html>
             message: text,
             url: link,
             file_id: fromRealtime ? "" : currentFileId,
+            conversation_id: currentConversationId,
             from_realtime: fromRealtime,
-            realtime_context: realtimeContext
+            realtime_context: realtimeContext,
+            typing_metrics: typingMetrics,
+            punctuation: punctuation
           })
         });
+        resetTypingMetrics();
         const data = await resp.json();
+        if (data.conversation_id) currentConversationId = data.conversation_id;
+        if (data.recent_chats) {
+          renderRecentChats(data.recent_chats, currentConversationId);
+          const activeChat = data.recent_chats.find(item => item.id === currentConversationId);
+          if (activeChat) setConversationTitle(activeChat.title);
+        }
         lastAssistantText = data.reply || "没有返回内容。";
         lastEmotion = extractEmotion(lastAssistantText);
         if (fromRealtime) suppressNextAutoTTS = true;
@@ -9417,6 +12359,9 @@ INDEX_HTML = r"""<!doctype html>
         if (data.growth) renderGrowth(data.growth);
         if (data.emotion_trend) renderEmotionChart(data.emotion_trend);
         if (data.diary_entries) renderDiary(data.diary_entries);
+        if (data.audit_status) renderAuditStatus(data.audit_status);
+        if (data.audit_corrections && data.audit_corrections.length) renderAuditCorrections(data.audit_corrections);
+        if (data.index_rebuild_status) renderTaskStatus(data.index_rebuild_status);
         loadMoments();
         if (fromRealtime && realtimeVoiceEnabled) {
           await speakRealtimeReply(lastAssistantText);
@@ -9448,7 +12393,28 @@ INDEX_HTML = r"""<!doctype html>
         message.focus();
       });
     });
+    document.querySelectorAll("[data-context-fill]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        if (!privacyAccepted) {
+          privacyOverlay.classList.remove("hidden");
+          return;
+        }
+        message.value = btn.dataset.contextFill || "";
+        message.focus();
+      });
+    });
+    if (newChatBtn) {
+      newChatBtn.addEventListener("click", () => {
+        currentConversationId = "";
+        resetChatView();
+        setConversationTitle("新对话");
+        renderRecentChats(recentChats, "");
+        message.value = "";
+        message.focus();
+      });
+    }
     loadPrivacyConsent();
+    loadRecentChats();
     fetch("/api/memory").then(r => r.json()).then(data => {
       renderMemory(data.memory);
       renderTraining(data.training);
@@ -9477,6 +12443,7 @@ INDEX_HTML = r"""<!doctype html>
     // -- plugin management --
     function renderPlugins(data) {
       const list = document.getElementById("plugin-list");
+      if (!list) return;
       if (!data.plugins || data.plugins.length === 0) {
         list.innerHTML = "<em>暂无插件。将插件文件夹放入 plugins/ 目录即可。</em>";
         return;
@@ -9511,32 +12478,32 @@ INDEX_HTML = r"""<!doctype html>
     }
     function loadPlugins() {
       fetch("/api/plugins").then(r => r.json()).then(renderPlugins).catch(() => {
-        document.getElementById("plugin-list").innerHTML = "<em>加载失败</em>";
+        const list = document.getElementById("plugin-list");
+        if (list) list.innerHTML = "<em>加载失败</em>";
       });
     }
-    document.getElementById("plugin-reload-btn").addEventListener("click", () => {
-      fetch("/api/plugins", {method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({action:"reload"})})
-        .then(() => { loadPlugins(); location.reload(); });
-    });
-    document.getElementById("plugin-new-btn").addEventListener("click", () => {
-      const name = prompt("插件文件夹名 (英文，如 my_tool):");
-      if (!name) return;
-      const desc = prompt("插件描述:") || "";
-      fetch("/api/plugins", {method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({action:"create", name: name, meta:{name:name, description:desc, version:"1.0.0"}})})
-        .then(() => { loadPlugins(); location.reload(); });
-    });
+    function bindPluginManagement() {
+      const reloadButton = document.getElementById("plugin-reload-btn");
+      const newButton = document.getElementById("plugin-new-btn");
+      reloadButton?.addEventListener("click", () => {
+        fetch("/api/plugins", {method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({action:"reload"})})
+          .then(() => { loadPlugins(); location.reload(); });
+      });
+      newButton?.addEventListener("click", () => {
+        const name = prompt("插件文件夹名 (英文，如 my_tool):");
+        if (!name) return;
+        const desc = prompt("插件描述:") || "";
+        fetch("/api/plugins", {method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({action:"create", name: name, meta:{name:name, description:desc, version:"1.0.0"}})})
+          .then(() => { loadPlugins(); location.reload(); });
+      });
+    }
 
     const observeScreenBtn = document.getElementById("observe-screen-btn");
     if (observeScreenBtn) {
       observeScreenBtn.addEventListener("click", observeScreen);
     }
-    // load plugins when details is opened
-    document.querySelector(".plugin-mgr").addEventListener("toggle", function() {
-      if (this.open) loadPlugins();
-    });
-
     // ---- Settings modal ----
     const settingsOverlay = document.createElement("div");
     settingsOverlay.className = "settings-overlay";
@@ -9569,6 +12536,7 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <div class="settings-actions">
               <button type="button" id="display-open-btn">进入显示主题</button>
+              <button type="button" id="tour-restart-btn">重新查看新手引导</button>
             </div>
           </div>
           <div class="settings-page" id="display-page-detail">
@@ -9595,12 +12563,18 @@ INDEX_HTML = r"""<!doctype html>
               <label>副强调<input type="color" id="custom-accent-2" value="#0b8f6f" /></label>
             </div>
             <button type="button" id="custom-theme-copy-btn">把当前预设作为自定义起点</button>
-            <div class="settings-slider"><label><span>字号</span><span id="display-font-scale-value">100%</span></label><input type="range" id="display-font-scale" min="85" max="125" value="100" /></div>
-            <div class="settings-slider"><label><span>界面密度</span><span id="display-density-value">100%</span></label><input type="range" id="display-density" min="80" max="125" value="100" /></div>
-            <div class="settings-slider"><label><span>圆角</span><span id="display-radius-value">8px</span></label><input type="range" id="display-radius" min="2" max="18" value="8" /></div>
-            <div class="settings-slider"><label><span>侧栏宽度</span><span id="display-sidebar-width-value">320px</span></label><input type="range" id="display-sidebar-width" min="240" max="440" value="320" /></div>
-            <div class="settings-slider"><label><span>桌宠展示区</span><span id="display-avatar-height-value">170px</span></label><input type="range" id="display-avatar-height" min="130" max="260" value="170" /></div>
-            <div class="theme-preview"><strong>预览</strong><span>调整会立即应用到当前主界面，保存后下次打开仍然保留。</span></div>
+            <div class="settings-slider"><label><span>字号</span><span class="settings-slider-value" id="display-font-scale-value">100%</span></label><input type="range" id="display-font-scale" min="85" max="125" value="100" /></div>
+            <div class="settings-slider"><label><span>界面密度</span><span class="settings-slider-value" id="display-density-value">100%</span></label><input type="range" id="display-density" min="80" max="125" value="100" /></div>
+            <div class="settings-slider"><label><span>圆角</span><span class="settings-slider-value" id="display-radius-value">8px</span></label><input type="range" id="display-radius" min="2" max="18" value="8" /></div>
+            <div class="settings-slider"><label><span>侧栏宽度</span><span class="settings-slider-value" id="display-sidebar-width-value">280px</span></label><input type="range" id="display-sidebar-width" min="240" max="440" value="280" /></div>
+            <div class="settings-slider"><label><span>助手状态区</span><span class="settings-slider-value" id="display-avatar-height-value">84px</span></label><input type="range" id="display-avatar-height" min="64" max="104" value="84" /></div>
+            <div class="theme-preview" id="display-theme-preview">
+              <strong>预览</strong><span>调整会立即应用到当前主界面，保存后下次打开仍然保留。</span>
+              <div class="theme-preview-surface" id="display-preview-surface">
+                <div class="theme-preview-side"><i></i><i></i><i></i></div>
+                <div class="theme-preview-main"><i class="theme-preview-line strong"></i><i class="theme-preview-line"></i><i class="theme-preview-line accent"></i></div>
+              </div>
+            </div>
             <div id="display-status" class="settings-note"></div>
             <div class="settings-actions">
               <button id="display-save-btn">保存显示设置</button>
@@ -9613,11 +12587,10 @@ INDEX_HTML = r"""<!doctype html>
           <div class="update-panel">
             <div class="update-page active" id="update-page-main">
               <div class="status" id="update-status" style="color:#657184">加载中...</div>
+              <div class="settings-note" id="update-source">检查地址：GitHub · LoongSerpent9Realms/companion-ai-release</div>
               <div class="update-summary" id="update-summary"></div>
               <div class="update-release-card" id="update-release-card"></div>
               <div class="update-config">
-                <label>更新清单 URL</label>
-                <input id="update-manifest-url" placeholder="https://api.github.com/repos/LoongSerpent9Realms/companion-ai-release/releases/latest" />
                 <div class="settings-row">
                   <label class="settings-check"><input type="checkbox" id="update-auto-check" /> 自动检查</label>
                   <label class="settings-check"><input type="checkbox" id="update-auto-download" /> 有新版自动下载</label>
@@ -9666,6 +12639,18 @@ INDEX_HTML = r"""<!doctype html>
             <button id="python-install-btn">自动安装 Python 3.12</button>
             <button id="shortcuts-uninstall-btn" class="danger" style="margin-left:8px">删除桌面/开始菜单快捷方式</button>
           </div>
+        <div class="settings-section" id="sec-cpp-toolchain">
+          <h3>━ C++ 工具链（刷题与代码练习）</h3>
+          <div class="status loading" id="cpp-toolchain-status">检测中…</div>
+          <div class="settings-note">安装 LLVM 会使用 Windows 的 winget 下载到指定目录，并将 bin 目录写入用户 PATH，其他新启动的应用也可使用。</div>
+          <label>安装目录或已有工具链目录</label>
+          <input id="cpp-toolchain-dir" type="text" spellcheck="false" />
+          <div class="settings-actions">
+            <button id="cpp-toolchain-install-btn">下载并安装 LLVM</button>
+            <button id="cpp-toolchain-path-btn">加入已有目录到 PATH</button>
+          </div>
+          <div id="cpp-toolchain-detail" class="settings-note"></div>
+        </div>
         <div class="settings-section" id="sec-datasets">
           <h3>━ 数据集工具 (ModelScope + Datasets)</h3>
           <div class="status loading" id="datasets-status">检测中…</div>
@@ -9727,6 +12712,8 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <button id="torch-install-btn">安装 PyTorch</button>
           <button id="torch-uninstall-btn" class="danger" style="display:none;margin-left:8px">删除</button>
+          <div id="torch-dx12-status" class="settings-note"></div>
+          <button type="button" id="torch-dx12-train-btn">使用 DX12 训练模型</button>
         </div>
         <div class="settings-section" id="sec-zluda">
           <h3>━ ZLUDA (AMD/Intel GPU 加速)</h3>
@@ -9855,6 +12842,85 @@ INDEX_HTML = r"""<!doctype html>
             <button id="identity-confirm-clear-btn" class="danger">清除当前确认</button>
           </div>
         </div>
+        <div class="settings-section" id="sec-local-growth">
+          <h3>━ 本地自成长</h3>
+          <div class="status" id="local-growth-status" style="color:#657184">加载中...</div>
+          <div class="settings-note">候选模型必须通过固定评测集才会激活；评测题永不混入训练。图片偏好只保存本地生成配方与采用反馈。</div>
+          <div class="settings-control-grid" style="margin-top:10px">
+            <div><label>验证经验</label><div id="growth-experience-count" class="settings-note">-</div></div>
+            <div><label>回放 / 留出评测</label><div id="growth-replay-count" class="settings-note">-</div></div>
+            <div><label>当前模型版本</label><div id="growth-active-version" class="settings-note">-</div></div>
+            <div><label>图片配方</label><div id="growth-image-status" class="settings-note">-</div></div>
+          </div>
+          <div class="settings-note" style="margin-top:12px">本地图片后端（可选 ComfyUI；仅连接本机服务，失败时自动回退到心情卡片）</div>
+          <div id="growth-image-backend-status" class="settings-note">加载中...</div>
+          <div class="settings-row" style="margin-top:8px">
+            <label class="settings-check"><input type="checkbox" id="growth-comfy-enabled" /> 使用 ComfyUI</label>
+          </div>
+          <div class="settings-control-grid" style="margin-top:8px">
+            <div><label>ComfyUI 地址</label><input id="growth-comfy-endpoint" placeholder="http://127.0.0.1:8188" /></div>
+            <div><label>API workflow JSON 路径</label><input id="growth-comfy-workflow" placeholder="C:\\...\\workflow_api.json" /></div>
+            <div><label>正向提示词节点 ID</label><input id="growth-comfy-prompt-node" placeholder="例如 6" /></div>
+            <div><label>负向提示词节点 ID（可留空）</label><input id="growth-comfy-negative-node" placeholder="例如 7" /></div>
+            <div><label>种子节点 ID（可留空）</label><input id="growth-comfy-seed-node" placeholder="例如 3" /></div>
+          </div>
+          <div class="settings-actions"><button id="growth-comfy-save-btn">保存并测试 ComfyUI</button></div>
+          <div class="settings-note" style="margin-top:10px">固定能力评测题</div>
+          <div id="growth-benchmark-list" class="voiceprint-list">加载中...</div>
+          <div class="settings-control-grid" style="margin-top:8px">
+            <div><label>问题</label><input id="growth-benchmark-prompt" placeholder="例如：你是谁？" /></div>
+            <div><label>必须出现的关键词（逗号分隔）</label><input id="growth-benchmark-keywords" placeholder="本地,伙伴" /></div>
+            <div><label>判定规则</label><select id="growth-benchmark-rule"><option value="keywords">包含全部关键词</option><option value="regex">正则匹配</option><option value="exact">完全一致</option><option value="max_length">最大字数（期望值填数字）</option><option value="manual">人工确认通过</option></select></div>
+          </div>
+          <div class="settings-actions">
+            <button id="growth-benchmark-add-btn">添加评测题</button>
+            <button id="growth-refresh-btn">刷新状态</button>
+            <button id="growth-rollback-btn" class="danger">回滚当前模型</button>
+          </div>
+          <div class="settings-note" style="margin-top:12px">真实样本标定（不会自动读取聊天；只保存你明确填入并批准的问答）</div>
+          <div class="settings-control-grid" style="margin-top:8px">
+            <div><label>实际问题</label><input id="growth-calibration-prompt" placeholder="例如：帮我安排明天的待办" /></div>
+            <div><label>期望回答</label><input id="growth-calibration-response" placeholder="填写你认可的本地回答" /></div>
+          </div>
+          <div class="settings-actions"><button id="growth-calibration-add-btn">批准为标定样本</button></div>
+          <div class="settings-note" style="margin-top:12px">后台候选训练</div>
+          <div id="growth-training-job" class="settings-note">暂无训练任务</div>
+          <div class="settings-actions">
+            <button id="growth-training-start-btn">后台训练候选模型</button>
+            <button id="growth-training-cancel-btn" class="danger">取消训练</button>
+          </div>
+          <div class="settings-note" style="margin-top:12px">模型版本（仅通过评测的版本可恢复）</div>
+          <div id="growth-version-list" class="voiceprint-list">加载中...</div>
+          <div class="settings-note" style="margin-top:12px">最近成长经验</div>
+          <div id="growth-experience-list" class="voiceprint-list">加载中...</div>
+          <div class="settings-note" style="margin-top:12px">图片配方反馈</div>
+          <div id="growth-recipe-list" class="voiceprint-list">加载中...</div>
+          <div class="settings-actions">
+            <button id="diagnostics-export-btn">导出本地诊断包</button>
+          </div>
+          <div id="diagnostics-result" class="settings-note"></div>
+        </div>
+        <div class="settings-section" id="sec-runtime-behavior">
+          <h3>━ 后台与启动</h3>
+          <div class="status" id="runtime-behavior-status" style="color:#657184">加载中...</div>
+          <div class="settings-note">梦境引擎只在系统和聊天都空闲、且没有全屏应用时运行。开机自启会在 Windows 的当前用户启动文件夹中创建本地入口。</div>
+          <div class="settings-row" style="margin-top:10px">
+            <label class="settings-check"><input type="checkbox" id="runtime-dream-enabled" /> 空闲时开启梦境引擎</label>
+            <label class="settings-check"><input type="checkbox" id="runtime-autostart" /> 开机自动启动 Companion AI 与桌宠</label>
+          </div>
+          <div class="settings-control-grid" style="margin-top:10px">
+            <div><label>系统空闲后开始（秒）</label><input id="runtime-system-idle" type="number" min="30" max="3600" /></div>
+            <div><label>聊天空闲后开始（秒）</label><input id="runtime-chat-idle" type="number" min="15" max="3600" /></div>
+            <div><label>记忆整理间隔（小时）</label><input id="runtime-review-interval" type="number" min="1" max="168" /></div>
+            <div><label>深度任务空闲要求（分钟）</label><input id="runtime-heavy-idle" type="number" min="1" max="240" /></div>
+            <div><label>静默时段（小时，逗号分隔）</label><input id="runtime-quiet-hours" placeholder="1,2,3,4,5" /></div>
+          </div>
+          <div class="settings-actions">
+            <button id="runtime-save-btn">保存后台设置</button>
+            <button id="runtime-review-btn">现在整理记忆</button>
+            <button id="runtime-practice-btn">现在进行代码练习</button>
+          </div>
+        </div>
         <div class="settings-section" id="sec-audit">
           <h3>━ 对话审计</h3>
           <div class="status" id="audit-status" style="color:#657184">加载中...</div>
@@ -9863,8 +12929,12 @@ INDEX_HTML = r"""<!doctype html>
               <input type="checkbox" id="audit-enabled" /> 启用对话审计
             </label>
             <label style="font-size:13px;display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:6px">
-              <input type="checkbox" id="audit-auto-suggest" /> 自动向审计 AI 请求改写建议
+              <input type="checkbox" id="audit-use-cloud" /> 使用云端审计辅助（默认仅本地规则）
             </label>
+            <label style="font-size:13px;display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:6px">
+              <input type="checkbox" id="audit-auto-suggest" /> 自动向审计 AI 请求改写建议并学习
+            </label>
+            <div class="settings-note" style="margin:5px 0 0 24px">默认只用本地规则核验格式、长度和基础情绪。勾选云端辅助后才会将对话发送到配置的审计服务；自动改写也仅在云端辅助开启时可用。</div>
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0">
             <div>
@@ -9877,7 +12947,9 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <div>
               <label>模型</label>
-              <input id="audit-model" placeholder="gpt-4o-mini" />
+              <input id="audit-model" list="audit-model-options" placeholder="gpt-4o-mini" />
+              <datalist id="audit-model-options"></datalist>
+              <div id="audit-model-discovery" class="settings-note"></div>
             </div>
             <div>
               <label>语言</label>
@@ -9910,6 +12982,7 @@ INDEX_HTML = r"""<!doctype html>
           <div style="margin:8px 0">
             <label class="settings-check"><input type="checkbox" id="remote-llm-enabled" /> 启用大模型接口</label>
             <label class="settings-check"><input type="checkbox" id="remote-llm-hybrid" /> 参与混合模式</label>
+            <label class="settings-check"><input type="checkbox" id="remote-llm-reasoning-enabled" /> 启用思考模式（仅支持 reasoning 的接口）</label>
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0">
             <div>
@@ -9922,7 +12995,9 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <div>
               <label>模型</label>
-              <input id="remote-llm-model" placeholder="gpt-4o-mini" />
+              <input id="remote-llm-model" list="remote-llm-model-options" placeholder="gpt-4o-mini" />
+              <datalist id="remote-llm-model-options"></datalist>
+              <div id="remote-llm-model-discovery" class="settings-note"></div>
             </div>
             <div>
               <label>温度</label>
@@ -9937,6 +13012,14 @@ INDEX_HTML = r"""<!doctype html>
               <input id="remote-llm-timeout" type="number" min="5" max="180" />
             </div>
           </div>
+          <div class="settings-row">
+            <label for="remote-llm-reasoning-effort">思考强度</label>
+            <select id="remote-llm-reasoning-effort">
+              <option value="low">低</option>
+              <option value="medium">中</option>
+              <option value="high">高</option>
+            </select>
+          </div>
           <label>用户提示词</label>
           <textarea id="remote-llm-user-prompt" placeholder="可选：写入你希望大模型遵守的角色、语气和回答偏好"></textarea>
           <div class="settings-note">这段内容会放入实际发送给大模型的系统提示中；内置系统提示由应用维护，不在界面中显示。</div>
@@ -9946,8 +13029,29 @@ INDEX_HTML = r"""<!doctype html>
             <button id="remote-llm-mode-btn">切到接口模式</button>
           </div>
         </div>
+        <div class="settings-section" id="sec-chat-mode">
+          <h3>━ 对话引擎</h3>
+          <div class="status" id="chat-mode-status" style="color:#657184">加载中...</div>
+          <div class="settings-note">稀疏增强模式先输入 <code>/train_sparse</code> 训练；它包含盘古 pi 级数激活与增强短路，并兼容旧稀疏权重。</div>
+          <label class="settings-check"><input type="checkbox" id="tiny-llm-deep-reply" /> TinyLLM 深度回答</label>
+          <div class="settings-note">为 TinyLLM 加入固定的回答框架以聚焦结论；不会生成、保存或展示思维链。</div>
+          <div class="settings-row">
+            <label for="chat-mode-select">当前引擎</label>
+            <select id="chat-mode-select"></select>
+          </div>
+          <div class="settings-actions">
+            <button id="chat-mode-save-btn">切换引擎</button>
+          </div>
+        </div>
         <div class="settings-section" id="sec-ai-plugin">
-          <h3>━ AI 插件沙箱</h3>
+          <h3>━ 插件与扩展</h3>
+          <div class="settings-note">已安装插件</div>
+          <div id="plugin-list" class="plugin-list" data-i18n="plugins_loading">加载中...</div>
+          <div class="settings-actions">
+            <button type="button" id="plugin-reload-btn" data-i18n="refresh_plugins">刷新插件</button>
+            <button type="button" id="plugin-new-btn" data-i18n="new_plugin">新建插件</button>
+          </div>
+          <h3>AI 插件沙箱</h3>
           <div class="status" id="ai-plugin-status" style="color:#657184">允许网络和文件能力；先在隔离目录验证并杀毒扫描，通过后才安装。</div>
           <input id="ai-plugin-dir" placeholder="插件目录名，如 ai_notes" />
           <input id="ai-plugin-name" placeholder="插件名称，如 AI Notes" />
@@ -9966,14 +13070,88 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>`;
     document.body.appendChild(settingsOverlay);
+    bindPluginManagement();
     applyI18n();
     applyDisplayConfig(i18nState?.config?.display || i18nState?.display || displayDefaults);
 
+    const settingsCategories = [
+      { group: "外观", id: "display", label: "显示与界面", sections: ["sec-display", "sec-language", "sec-pet-display"] },
+      { group: "应用", id: "update", label: "更新与数据", sections: ["sec-update", "sec-identity", "sec-memory", "sec-privacy"] },
+      { group: "智能", id: "ai", label: "AI 与模型", sections: ["sec-chat-mode", "sec-remote-llm", "sec-audit", "sec-local-growth", "sec-runtime-behavior", "sec-python", "sec-torch", "sec-zluda", "sec-datasets", "sec-ocr"] },
+      { group: "输入与身份", id: "voice", label: "语音与身份", sections: ["sec-tts", "sec-voiceprint", "sec-identity-confirm"] },
+      { group: "视觉与角色", id: "visual", label: "视觉与角色", sections: ["sec-camera", "sec-opencv", "sec-face", "sec-live2d", "sec-3d"] },
+      { group: "扩展", id: "plugins", label: "插件与扩展", sections: ["sec-ai-plugin"] },
+    ];
+    const settingsGrid = settingsOverlay.querySelector(".settings-grid");
+    const settingsSections = [...settingsGrid.querySelectorAll(":scope > .settings-section")];
+    const settingsNav = document.createElement("nav");
+    settingsNav.className = "settings-category-nav";
+    settingsNav.setAttribute("aria-label", "设置类别");
+    const settingsContent = document.createElement("div");
+    settingsContent.className = "settings-content";
+    settingsGrid.replaceChildren(settingsNav, settingsContent);
+    settingsSections.forEach(section => settingsContent.appendChild(section));
+
+    let activeSettingsCategory = "display";
+    let activeSettingsSecondaryPage = "";
+    function showSettingsCategory(categoryId) {
+      const category = settingsCategories.find(item => item.id === categoryId) || settingsCategories[0];
+      activeSettingsCategory = category.id;
+      if (activeSettingsSecondaryPage) {
+        document.getElementById("sec-display")?.classList.remove("settings-secondary-active");
+        document.getElementById("display-page-main")?.classList.add("active");
+        document.getElementById("display-page-detail")?.classList.remove("active");
+      }
+      activeSettingsSecondaryPage = "";
+      settingsSections.forEach(section => {
+        section.hidden = !category.sections.includes(section.id);
+      });
+      settingsNav.querySelectorAll("[data-settings-category]").forEach(button => {
+        const active = button.dataset.settingsCategory === category.id;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-current", active ? "page" : "false");
+      });
+      settingsContent.scrollTop = 0;
+    }
+    function showSettingsSecondaryPage(sectionId) {
+      activeSettingsSecondaryPage = sectionId;
+      document.getElementById(sectionId)?.classList.add("settings-secondary-active");
+      settingsSections.forEach(section => {
+        section.hidden = section.id !== sectionId;
+      });
+      settingsContent.scrollTop = 0;
+    }
+    settingsCategories.forEach((category, index) => {
+      const previous = settingsCategories[index - 1];
+      if (!previous || previous.group !== category.group) {
+        const group = document.createElement("div");
+        group.className = "settings-category-group";
+        group.dataset.settingsGroup = category.group;
+        const label = document.createElement("div");
+        label.className = "settings-category-label";
+        label.textContent = category.group;
+        group.appendChild(label);
+        settingsNav.appendChild(group);
+      }
+      const group = settingsNav.lastElementChild;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "settings-category-button";
+      button.dataset.settingsCategory = category.id;
+      button.textContent = category.label;
+      button.addEventListener("click", () => showSettingsCategory(category.id));
+      group.appendChild(button);
+    });
+    showSettingsCategory(activeSettingsCategory);
+
     document.getElementById("settings-btn").addEventListener("click", () => {
       settingsOverlay.classList.add("open");
+      showDisplayPage("main");
+      showSettingsCategory(activeSettingsCategory);
       const settingsLanguageSelect = document.getElementById("settings-language-select");
       if (settingsLanguageSelect) settingsLanguageSelect.value = i18nState?.locale || "zh-CN";
       loadSettings();
+      loadPlugins();
     });
     document.getElementById("settings-close").addEventListener("click", () => {
       settingsOverlay.classList.remove("open");
@@ -9987,6 +13165,10 @@ INDEX_HTML = r"""<!doctype html>
       languageSelect.dispatchEvent(new Event("change"));
     });
     document.getElementById("display-open-btn")?.addEventListener("click", () => showDisplayPage("detail"));
+    document.getElementById("tour-restart-btn")?.addEventListener("click", () => {
+      settingsOverlay.classList.remove("open");
+      window.startGuidedTour?.();
+    });
     document.getElementById("display-back-btn")?.addEventListener("click", () => showDisplayPage("main"));
     document.querySelectorAll('input[name="display-theme"], #display-font-scale, #display-density, #display-radius, #display-sidebar-width, #display-avatar-height, #custom-theme-grid input[type="color"]').forEach(el => {
       el.addEventListener("input", () => applyDisplayConfig(displayConfigFromControls()));
@@ -10197,7 +13379,8 @@ INDEX_HTML = r"""<!doctype html>
         const source = String(item.audit_source || "");
         const isLocalAudit = source === "local" || source === "local_quick";
         const sourceLabel = isLocalAudit ? "本地规则审计" : (source ? "AI 审计" : "审计");
-        const needsAction = !!item.needs_user_action || (quality != null && quality < 0.65) || (correctness != null && correctness < 0.65);
+        const autoApplied = item.review_status === "auto_applied" || !!item.auto_apply_suggested_correction;
+        const needsAction = !autoApplied && (!!item.needs_user_action || (quality != null && quality < 0.65) || (correctness != null && correctness < 0.65));
         const suggested = trainingResponseText(item.suggested_response || "");
         const correctionPending = !!item.correction_pending && !suggested;
         const title = document.createElement("div");
@@ -10206,7 +13389,7 @@ INDEX_HTML = r"""<!doctype html>
         const body = document.createElement("div");
         body.style.whiteSpace = "pre-wrap";
         body.textContent = [
-          correctionPending ? "状态：已加入审计队列，正在等待审计 AI 生成改写建议。" : (needsAction ? "状态：待处理。请改正并训练，或采用审计 AI 给出的建议改写。" : ""),
+          correctionPending ? "状态：已加入审计队列，正在等待审计 AI 生成改写建议。" : (autoApplied ? "状态：已自动采用审计 AI 的改写并写入训练记忆。" : (needsAction ? "状态：待处理。请改正并训练，或采用审计 AI 给出的建议改写。" : "")),
           isLocalAudit ? "来源：本地规则审计，分数是粗略提示，主要用于发现需要改写训练的回复。" : "",
           `问：${String(item.user_message || "").replace(/\s+/g, " ").slice(0, 120)}`,
           `答：${trainingResponseText(item.ai_reply || "").replace(/\s+/g, " ").slice(0, 160)}`,
@@ -10214,6 +13397,8 @@ INDEX_HTML = r"""<!doctype html>
           item.suggestions?.length ? `建议：${item.suggestions.slice(0, 2).join("；")}` : "",
           suggested ? `建议改写：${suggested.replace(/\s+/g, " ").slice(0, 180)}` : (correctionPending ? "建议改写：生成中，请稍后刷新设置页查看。" : (needsAction ? "建议改写：尚未生成。可勾选“自动向审计 AI 请求改写建议”，让后台自动生成。" : "")),
           item.correction_reason ? `改写原因：${String(item.correction_reason).replace(/\s+/g, " ").slice(0, 120)}` : "",
+          item.audit_error ? `审计说明：${String(item.audit_error).replace(/\s+/g, " ").slice(0, 160)}` : "",
+          item.correction_error ? `改写说明：${String(item.correction_error).replace(/\s+/g, " ").slice(0, 160)}` : "",
         ].filter(Boolean).join("\n");
         const actions = document.createElement("div");
         actions.style.display = "flex";
@@ -10275,6 +13460,19 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    function updateTorchDx12Training(neuralInfo) {
+      const btn = document.getElementById("torch-dx12-train-btn");
+      const status = document.getElementById("torch-dx12-status");
+      if (!btn || !status) return;
+      const torch = neuralInfo?.torch || {};
+      const ready = !!torch.available && !!torch.directml_available;
+      btn.disabled = !ready;
+      status.textContent = ready
+        ? "DirectX 12 (DirectML) 已就绪。训练会在独立进程中运行。"
+        : "需要安装 PyTorch 的 DirectML 版本，才能使用 DX12 训练。";
+      status.className = ready ? "settings-note" : "settings-note status err";
+    }
+
     async function submitAuditTraining(auditId, decision, correctedResponse, actions) {
       const statusEl = actions?.querySelector("span");
       if (!auditId) {
@@ -10324,14 +13522,18 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll(".component-progress.open").forEach(el => el.classList.remove("open", "installing", "ok", "err"));
       loadUpdateSettings();
       loadDisplaySettings();
+      loadLocalGrowthSettings();
+      loadRuntimeBehaviorSettings();
       fetch("/api/settings").then(r => r.json()).then(data => {
         updateSection("ocr", data.ocr);
         updateSection("torch", data.torch);
+        updateTorchDx12Training(data.neural);
         updateSection("zluda", data.zluda);
         updateSection("opencv", data.opencv);
         updateSection("datasets", data.datasets);
         updateSection("tts", data.tts);
         updatePythonSection(data.python);
+        updateCppToolchainSection(data.cpp_toolchain);
         updateCameraSection(data.opencv);
         // Load face recognition status
         fetch("/api/face/status").then(r => r.json()).then(data => {
@@ -10366,6 +13568,7 @@ INDEX_HTML = r"""<!doctype html>
       fetch("/api/settings/audit").then(r => r.json()).then(data => {
         const cfg = data.config || {};
         document.getElementById("audit-enabled").checked = !!data.enabled;
+        document.getElementById("audit-use-cloud").checked = !!cfg.use_cloud_audit;
         document.getElementById("audit-auto-suggest").checked = !!cfg.auto_suggest_corrections;
         document.getElementById("audit-api-base").value = cfg.api_base || "";
         document.getElementById("audit-api-key").value = "";
@@ -10375,9 +13578,11 @@ INDEX_HTML = r"""<!doctype html>
         document.getElementById("audit-batch-size").value = cfg.batch_size || 5;
         document.getElementById("audit-interval").value = cfg.audit_interval || 10;
         document.getElementById("audit-context-turns").value = cfg.max_context_turns || 6;
+        scheduleModelDiscovery("audit", 0, true);
         const statusEl = document.getElementById("audit-status");
         if (data.enabled) {
-          statusEl.textContent = cfg.auto_suggest_corrections ? "审计已启用，后台会请求审计 AI 生成改写建议" : "审计已启用";
+          const mode = cfg.use_cloud_audit ? "云端辅助" : "本地规则";
+          statusEl.textContent = cfg.auto_suggest_corrections && cfg.use_cloud_audit ? `审计已启用（${mode}），云端改写建议会自动写入训练记忆` : `审计已启用（${mode}），审计结果需人工审核后学习`;
           statusEl.className = "status ok";
         } else {
           statusEl.textContent = "审计未启用";
@@ -10408,11 +13613,14 @@ INDEX_HTML = r"""<!doctype html>
         const cfg = data.config || {};
         document.getElementById("remote-llm-enabled").checked = !!cfg.enabled;
         document.getElementById("remote-llm-hybrid").checked = cfg.enabled_for_hybrid !== false;
+        document.getElementById("remote-llm-reasoning-enabled").checked = !!cfg.reasoning_enabled;
+        document.getElementById("remote-llm-reasoning-effort").value = cfg.reasoning_effort || "medium";
         document.getElementById("remote-llm-api-base").value = cfg.api_base || "";
         document.getElementById("remote-llm-api-key").value = "";
         document.getElementById("remote-llm-api-key").placeholder = cfg.configured ? (cfg.api_key || "已配置") : "sk-...";
         document.getElementById("remote-llm-model").value = cfg.model || "";
         document.getElementById("remote-llm-temperature").value = cfg.temperature ?? 0.7;
+        scheduleModelDiscovery("remote_llm", 0, true);
         document.getElementById("remote-llm-max-tokens").value = cfg.max_tokens || 1024;
         document.getElementById("remote-llm-timeout").value = cfg.timeout || 45;
         document.getElementById("remote-llm-user-prompt").value = cfg.user_prompt || "";
@@ -10430,6 +13638,32 @@ INDEX_HTML = r"""<!doctype html>
       }).catch(() => {
         document.getElementById("remote-llm-status").textContent = "加载大模型接口配置失败";
         document.getElementById("remote-llm-status").className = "status err";
+      });
+
+      fetch("/api/chat/modes").then(r => r.json()).then(data => {
+        const select = document.getElementById("chat-mode-select");
+        const statusEl = document.getElementById("chat-mode-status");
+        const modes = Array.isArray(data.modes) ? data.modes : [];
+        select.replaceChildren(...modes.map(mode => {
+          const option = document.createElement("option");
+          option.value = mode.id;
+          option.textContent = mode.name + " - " + mode.description;
+          option.selected = !!mode.active;
+          return option;
+        }));
+        const active = modes.find(mode => mode.active);
+        statusEl.textContent = active ? "当前使用：" + active.name : "未选择对话引擎";
+        statusEl.className = "status";
+      }).catch(() => {
+        document.getElementById("chat-mode-status").textContent = "加载对话引擎失败";
+        document.getElementById("chat-mode-status").className = "status err";
+      });
+
+      fetch("/api/settings/tiny_llm").then(r => r.json()).then(data => {
+        document.getElementById("tiny-llm-deep-reply").checked = !!data.enabled;
+      }).catch(() => {
+        document.getElementById("chat-mode-status").textContent = "加载 TinyLLM 设置失败";
+        document.getElementById("chat-mode-status").className = "status err";
       });
 
       fetch("/api/privacy").then(r => r.json()).then(data => {
@@ -10650,7 +13884,6 @@ INDEX_HTML = r"""<!doctype html>
       const releaseEl = document.getElementById("update-release-card");
       if (!statusEl || !detailEl || !summaryEl || !releaseEl || !data) return;
       latestUpdateState = data;
-      document.getElementById("update-manifest-url").value = data.manifest_url || "";
       document.getElementById("update-auto-check").checked = !!data.auto_check;
       document.getElementById("update-auto-download").checked = !!data.auto_download;
       document.getElementById("update-auto-install").checked = !!data.auto_install;
@@ -10675,7 +13908,13 @@ INDEX_HTML = r"""<!doctype html>
         <div class="update-meta">${releaseMeta.length ? escapeSettingsText(releaseMeta.join("\n")) : "检查更新后会显示安装包和发布说明。"}</div>
         <button type="button" class="update-page-link" id="update-log-btn">查看更新日志</button>
       `;
-      detailEl.textContent = latest.release_url ? `发布页：${latest.release_url}` : "";
+      const sourceEl = document.getElementById("update-source");
+      if (sourceEl) {
+        const repo = data.release_repo || "LoongSerpent9Realms/companion-ai-release";
+        const page = data.release_page || (`https://github.com/${repo}/releases`);
+        sourceEl.innerHTML = `检查地址：<a href="${escapeSettingsText(page)}" target="_blank" rel="noopener noreferrer">GitHub · ${escapeSettingsText(repo)}</a>`;
+      }
+      detailEl.textContent = latest.release_url ? `发布页：${latest.release_url}` : (data.release_page ? `发布页：${data.release_page}` : "");
       renderUpdateLogPage(data);
       document.getElementById("update-log-btn")?.addEventListener("click", () => showUpdatePage("log"));
       if (data.update_available) {
@@ -10711,7 +13950,6 @@ INDEX_HTML = r"""<!doctype html>
     function updatePayloadFromForm(action) {
       return {
         action,
-        manifest_url: document.getElementById("update-manifest-url").value.trim(),
         auto_check: document.getElementById("update-auto-check").checked,
         auto_download: document.getElementById("update-auto-download").checked,
         auto_install: document.getElementById("update-auto-install").checked,
@@ -10957,6 +14195,47 @@ INDEX_HTML = r"""<!doctype html>
         if (detailEl) detailEl.textContent = pythonInfo ? pythonInfo.detail : "";
         if (sizeEl) sizeEl.textContent = sizeText ? "已占用：" + sizeText : "安装后占用：安装完成后显示";
       }
+    }
+
+    function updateCppToolchainSection(info) {
+      const status = document.getElementById("cpp-toolchain-status");
+      const detail = document.getElementById("cpp-toolchain-detail");
+      const input = document.getElementById("cpp-toolchain-dir");
+      if (!status || !input) return;
+      input.value = info?.install_dir || input.value || "";
+      status.textContent = info?.installed ? "C++ 工具链可用" : "未检测到 C++ 工具链";
+      status.className = info?.installed ? "status ok" : "status err";
+      if (detail) {
+        const compiler = info?.compiler ? `\n编译器：${info.compiler}` : "";
+        const path = info?.bin_dir ? `\n已配置 bin：${info.bin_dir}` : "";
+        detail.textContent = (info?.detail || "") + compiler + path;
+      }
+    }
+
+    function runCppToolchainAction(component, buttonId, idleLabel) {
+      const button = document.getElementById(buttonId);
+      const status = document.getElementById("cpp-toolchain-status");
+      const detail = document.getElementById("cpp-toolchain-detail");
+      const installDir = document.getElementById("cpp-toolchain-dir")?.value.trim() || "";
+      if (!installDir) {
+        if (detail) detail.textContent = "请先填写安装目录或已有工具链目录。";
+        return;
+      }
+      if (button) { button.disabled = true; button.textContent = component === "cpp_toolchain" ? "安装中…" : "写入 PATH…"; }
+      if (status) { status.textContent = component === "cpp_toolchain" ? "正在下载并安装 LLVM…" : "正在验证并写入用户 PATH…"; status.className = "status loading"; }
+      fetch("/api/settings/install", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({component, install_dir: installDir})
+      }).then(r => r.json()).then(data => {
+        if (detail) detail.textContent = data.detail || (data.success ? "操作完成" : "操作失败");
+        if (status) { status.textContent = data.success ? "C++ 工具链已就绪" : "C++ 工具链设置失败"; status.className = data.success ? "status ok" : "status err"; }
+        if (data.success) loadSettings();
+      }).catch(err => {
+        if (detail) detail.textContent = "请求失败：" + String(err);
+        if (status) { status.textContent = "C++ 工具链设置失败"; status.className = "status err"; }
+      }).finally(() => {
+        if (button) { button.disabled = false; button.textContent = idleLabel; }
+      });
     }
 
     function installPython() {
@@ -11310,6 +14589,235 @@ INDEX_HTML = r"""<!doctype html>
       sendChat();
     }
 
+    function renderGrowthBenchmarks(items) {
+      const list = document.getElementById("growth-benchmark-list");
+      list.innerHTML = "";
+      if (!items.length) {
+        list.textContent = "暂无评测题。先添加 1 条题目，候选模型才允许激活。";
+        return;
+      }
+      items.forEach(item => {
+        const row = document.createElement("div");
+        row.className = "voiceprint-item";
+        const text = document.createElement("span");
+        text.textContent = `${item.prompt}（${item.rule || "keywords"}：${(item.expected_keywords || []).join("、") || "人工确认"}）`;
+        const edit = document.createElement("button");
+        edit.type = "button";
+        edit.textContent = "修改";
+        edit.addEventListener("click", async () => {
+          const prompt = window.prompt("评测问题", item.prompt || "");
+          if (prompt === null) return;
+          const keywords = window.prompt("必须出现的关键词（逗号分隔）", (item.expected_keywords || []).join(","));
+          if (keywords === null) return;
+          const rule = window.prompt("规则：keywords / regex / exact / max_length / manual", item.rule || "keywords");
+          if (rule === null) return;
+          const manual_pass = rule === "manual" ? confirm("此题当前是否手动确认通过？") : undefined;
+          const resp = await fetch("/api/settings/growth", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({action:"update_benchmark", id:item.id, prompt, keywords, rule, manual_pass})});
+          const data = await resp.json();
+          if (!data.ok) alert(data.error || "更新失败");
+          loadLocalGrowthSettings();
+        });
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "danger";
+        remove.textContent = "删除";
+        remove.addEventListener("click", async () => {
+          remove.disabled = true;
+          const resp = await fetch("/api/settings/growth", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({action:"remove_benchmark", id:item.id})});
+          const data = await resp.json();
+          if (!data.ok) alert(data.error || "删除失败");
+          loadLocalGrowthSettings();
+        });
+        row.append(text, edit, remove);
+        list.appendChild(row);
+      });
+    }
+
+    function loadLocalGrowthSettings() {
+      fetch("/api/settings/growth").then(r => r.json()).then(data => {
+        if (!data.ok) throw new Error(data.error || "读取失败");
+        const growth = data.growth || {};
+        const image = data.image || {};
+        document.getElementById("growth-experience-count").textContent = `${growth.eligible_experiences || 0} 条可训练经验`;
+        document.getElementById("growth-replay-count").textContent = `${growth.replay_samples || 0} 条回放 / ${growth.held_out_samples || 0} 条留出`;
+        document.getElementById("growth-active-version").textContent = growth.active_version || "未激活";
+        document.getElementById("growth-image-status").textContent = `生成 ${image.generated || 0} · 采用 ${image.accepted || 0}`;
+        const backend = data.image_backend || {};
+        document.getElementById("growth-comfy-enabled").checked = !!backend.enabled;
+        document.getElementById("growth-comfy-endpoint").value = backend.endpoint || "http://127.0.0.1:8188";
+        document.getElementById("growth-comfy-workflow").value = backend.workflow_path || "";
+        document.getElementById("growth-comfy-prompt-node").value = backend.prompt_node_id || "";
+        document.getElementById("growth-comfy-negative-node").value = backend.negative_prompt_node_id || "";
+        document.getElementById("growth-comfy-seed-node").value = backend.seed_node_id || "";
+        document.getElementById("growth-image-backend-status").textContent = backend.message || "内置心情卡片正在使用。";
+        document.getElementById("local-growth-status").textContent = `固定评测题 ${data.benchmarks.length} 条；未通过候选 ${growth.rejected_candidates || 0} 个`;
+        document.getElementById("local-growth-status").className = "status ok";
+        renderGrowthBenchmarks(data.benchmarks || []);
+        renderGrowthVersions(data.versions || []);
+        renderGrowthExperiences(data.experiences || []);
+        renderGrowthRecipes(data.recipes || []);
+        const job = data.training_job || {};
+        document.getElementById("growth-training-job").textContent = `${job.state || "idle"} · ${job.stage || ""} · ${job.progress ?? 0}%：${job.message || "暂无训练任务"}`;
+        if (["queued", "training"].includes(job.state)) setTimeout(loadLocalGrowthSettings, 2000);
+      }).catch(err => {
+        const status = document.getElementById("local-growth-status");
+        status.textContent = "加载本地成长状态失败：" + err;
+        status.className = "status err";
+      });
+    }
+
+    async function growthPost(payload) {
+      const resp = await fetch("/api/settings/growth", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+      const data = await resp.json();
+      if (!data.ok) throw new Error(data.error || "操作失败");
+      loadLocalGrowthSettings();
+      return data;
+    }
+
+    function renderGrowthVersions(items) {
+      const list = document.getElementById("growth-version-list"); list.innerHTML = "";
+      if (!items.length) { list.textContent = "暂无已登记模型版本。"; return; }
+      items.forEach(item => {
+        const row = document.createElement("div"); row.className = "voiceprint-item";
+        const text = document.createElement("span");
+        text.textContent = `${item.active ? "当前 · " : ""}${item.id}｜训练 ${item.train_samples || "?"} 条｜评测 ${item.benchmark_score ?? "?"}/${item.benchmark_total ?? "?"}｜${item.status || "archived"}`;
+        row.appendChild(text);
+        if (!item.active && item.status !== "rejected") {
+          const button = document.createElement("button"); button.textContent = "恢复";
+          button.addEventListener("click", () => growthPost({action:"activate_version", id:item.id}).catch(err => alert(err)));
+          row.appendChild(button);
+        }
+        list.appendChild(row);
+      });
+    }
+
+    function renderGrowthExperiences(items) {
+      const list = document.getElementById("growth-experience-list"); list.innerHTML = "";
+      if (!items.length) { list.textContent = "暂无经验。"; return; }
+      items.slice(0, 12).forEach(item => {
+        const row = document.createElement("div"); row.className = "voiceprint-item";
+        const text = document.createElement("span"); text.textContent = `${item.verified ? "✓" : "○"} ${item.prompt || ""}（${item.source || "local"}，奖励 ${item.reward ?? 0}）`;
+        const toggle = document.createElement("button"); toggle.textContent = item.verified ? "停用" : "批准";
+        toggle.addEventListener("click", () => growthPost({action:"update_experience", id:item.id, verified:!item.verified, reward:item.verified ? 0 : 1}).catch(err => alert(err)));
+        const remove = document.createElement("button"); remove.className = "danger"; remove.textContent = "删除";
+        remove.addEventListener("click", () => { if (confirm("删除这条经验？")) growthPost({action:"delete_experience", id:item.id}).catch(err => alert(err)); });
+        row.append(text, toggle, remove); list.appendChild(row);
+      });
+    }
+
+    function renderGrowthRecipes(items) {
+      const list = document.getElementById("growth-recipe-list"); list.innerHTML = "";
+      if (!items.length) { list.textContent = "暂无生成配方。"; return; }
+      items.slice(0, 12).forEach(item => {
+        const row = document.createElement("div"); row.className = "voiceprint-item";
+        const text = document.createElement("span"); text.textContent = `${item.mood || "未标注"}｜${item.feedback || "pending"}｜${item.kind || "image"}`;
+        ["accepted", "too_bright", "too_dark", "simpler", "rejected"].forEach(label => {
+          const button = document.createElement("button"); button.textContent = label;
+          button.addEventListener("click", () => growthPost({action:"image_feedback", path:item.path, feedback:label}).catch(err => alert(err)));
+          row.appendChild(button);
+        });
+        row.prepend(text); list.appendChild(row);
+      });
+    }
+
+    function loadRuntimeBehaviorSettings() {
+      fetch("/api/settings/runtime").then(r => r.json()).then(data => {
+        if (!data.ok) throw new Error(data.error || "读取失败");
+        const cfg = data.dream || {};
+        const state = data.status || {};
+        document.getElementById("runtime-dream-enabled").checked = !!cfg.enabled;
+        document.getElementById("runtime-autostart").checked = !!data.autostart;
+        document.getElementById("runtime-system-idle").value = cfg.system_idle_threshold_seconds || 60;
+        document.getElementById("runtime-chat-idle").value = cfg.chat_idle_threshold_seconds || 30;
+        document.getElementById("runtime-review-interval").value = cfg.review_interval_hours || 4;
+        document.getElementById("runtime-heavy-idle").value = Math.round((cfg.heavy_task_system_idle_min || 300) / 60);
+        document.getElementById("runtime-quiet-hours").value = (cfg.quiet_hours || []).join(",");
+        const idle = state.idle || {};
+        const status = document.getElementById("runtime-behavior-status");
+        status.textContent = `梦境引擎${state.running ? "运行中" : "待命"} · 系统空闲 ${Math.round(idle.sys_idle_sec || 0)} 秒 · 聊天空闲 ${Math.round(idle.chat_idle_sec || 0)} 秒`;
+        status.className = "status ok";
+      }).catch(err => {
+        const status = document.getElementById("runtime-behavior-status");
+        status.textContent = "加载后台设置失败：" + err;
+        status.className = "status err";
+      });
+    }
+
+    async function runtimeAction(payload, statusText) {
+      const status = document.getElementById("runtime-behavior-status");
+      status.textContent = statusText;
+      status.className = "status";
+      try {
+        const resp = await fetch("/api/settings/runtime", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || "操作失败");
+        status.textContent = data.message || "已完成";
+        status.className = "status ok";
+        loadRuntimeBehaviorSettings();
+      } catch (err) {
+        status.textContent = "操作失败：" + err;
+        status.className = "status err";
+      }
+    }
+
+    document.getElementById("growth-refresh-btn").addEventListener("click", loadLocalGrowthSettings);
+    document.getElementById("growth-benchmark-add-btn").addEventListener("click", async () => {
+      const prompt = document.getElementById("growth-benchmark-prompt").value.trim();
+      const keywords = document.getElementById("growth-benchmark-keywords").value.trim();
+      const rule = document.getElementById("growth-benchmark-rule").value;
+      if (!prompt || (!keywords && rule !== "manual")) { alert("请填写问题和期望值；人工确认题可不填期望值。"); return; }
+      const resp = await fetch("/api/settings/growth", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({action:"add_benchmark", prompt, keywords, rule})});
+      const data = await resp.json();
+      if (!data.ok) { alert(data.error || "添加失败"); return; }
+      document.getElementById("growth-benchmark-prompt").value = "";
+      document.getElementById("growth-benchmark-keywords").value = "";
+      loadLocalGrowthSettings();
+    });
+    document.getElementById("growth-rollback-btn").addEventListener("click", async () => {
+      if (!confirm("回滚到上一版 TinyLLM？")) return;
+      const resp = await fetch("/api/settings/growth", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({action:"rollback"})});
+      const data = await resp.json();
+      if (!data.ok) alert(data.error || "回滚失败");
+      loadLocalGrowthSettings();
+    });
+    document.getElementById("growth-training-start-btn").addEventListener("click", () => growthPost({action:"start_training", epochs:3}).catch(err => alert(err)));
+    document.getElementById("growth-training-cancel-btn").addEventListener("click", () => growthPost({action:"cancel_training"}).catch(err => alert(err)));
+    document.getElementById("growth-calibration-add-btn").addEventListener("click", () => {
+      const prompt = document.getElementById("growth-calibration-prompt").value.trim();
+      const response = document.getElementById("growth-calibration-response").value.trim();
+      if (!prompt || !response) { alert("请填写实际问题和你认可的回答。"); return; }
+      growthPost({action:"add_calibration", prompt, response}).then(() => {
+        document.getElementById("growth-calibration-prompt").value = "";
+        document.getElementById("growth-calibration-response").value = "";
+      }).catch(err => alert(err));
+    });
+    document.getElementById("growth-comfy-save-btn").addEventListener("click", async () => {
+      try {
+        const data = await growthPost({action:"save_image_backend", backend:"comfyui", enabled:document.getElementById("growth-comfy-enabled").checked, endpoint:document.getElementById("growth-comfy-endpoint").value.trim(), workflow_path:document.getElementById("growth-comfy-workflow").value.trim(), prompt_node_id:document.getElementById("growth-comfy-prompt-node").value.trim(), negative_prompt_node_id:document.getElementById("growth-comfy-negative-node").value.trim(), seed_node_id:document.getElementById("growth-comfy-seed-node").value.trim()});
+        alert(data.message || "已保存");
+      } catch (err) { alert(err); }
+    });
+    document.getElementById("diagnostics-export-btn").addEventListener("click", async () => {
+      const out = document.getElementById("diagnostics-result"); out.textContent = "正在导出不含聊天内容和密钥的诊断包…";
+      try {
+        const resp = await fetch("/api/settings/diagnostics", {method:"POST"}); const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || "导出失败"); out.textContent = `诊断包已导出：${data.path}`;
+      } catch (err) { out.textContent = "诊断包导出失败：" + err; }
+    });
+    document.getElementById("runtime-save-btn").addEventListener("click", () => {
+      const quietHours = document.getElementById("runtime-quiet-hours").value.split(",").map(x => Number(x.trim())).filter(x => Number.isInteger(x) && x >= 0 && x <= 23);
+      runtimeAction({
+        action:"save", dream_enabled:document.getElementById("runtime-dream-enabled").checked,
+        autostart:document.getElementById("runtime-autostart").checked,
+        system_idle_threshold_seconds:Number(document.getElementById("runtime-system-idle").value),
+        chat_idle_threshold_seconds:Number(document.getElementById("runtime-chat-idle").value),
+        review_interval_hours:Number(document.getElementById("runtime-review-interval").value),
+        heavy_task_idle_minutes:Number(document.getElementById("runtime-heavy-idle").value), quiet_hours:quietHours,
+      }, "正在保存后台设置…");
+    });
+    document.getElementById("runtime-review-btn").addEventListener("click", () => runtimeAction({action:"review_now"}, "正在整理记忆…"));
+    document.getElementById("runtime-practice-btn").addEventListener("click", () => runtimeAction({action:"practice_now"}, "正在进行代码练习…"));
+
     // Save audit config
     document.getElementById("audit-save-btn").addEventListener("click", () => {
       const btn = document.getElementById("audit-save-btn");
@@ -11318,6 +14826,7 @@ INDEX_HTML = r"""<!doctype html>
       btn.textContent = "保存中…";
       const payload = {
         enabled: document.getElementById("audit-enabled").checked,
+        use_cloud_audit: document.getElementById("audit-use-cloud").checked,
         auto_suggest_corrections: document.getElementById("audit-auto-suggest").checked,
         api_base: document.getElementById("audit-api-base").value.trim(),
         model: document.getElementById("audit-model").value.trim(),
@@ -11358,6 +14867,8 @@ INDEX_HTML = r"""<!doctype html>
       const payload = {
         enabled: document.getElementById("remote-llm-enabled").checked,
         enabled_for_hybrid: document.getElementById("remote-llm-hybrid").checked,
+        reasoning_enabled: document.getElementById("remote-llm-reasoning-enabled").checked,
+        reasoning_effort: document.getElementById("remote-llm-reasoning-effort").value,
         api_base: document.getElementById("remote-llm-api-base").value.trim(),
         model: document.getElementById("remote-llm-model").value.trim(),
         temperature: parseFloat(document.getElementById("remote-llm-temperature").value) || 0.7,
@@ -11368,6 +14879,96 @@ INDEX_HTML = r"""<!doctype html>
       if (apiKey) payload.api_key = apiKey;
       return payload;
     }
+
+    document.getElementById("tiny-llm-deep-reply").addEventListener("change", event => {
+      fetch("/api/settings/tiny_llm", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({enabled: event.target.checked})})
+        .then(r => r.json()).then(data => {
+          if (!data.ok) throw new Error(data.error || "未知错误");
+        }).catch(() => {
+          event.target.checked = !event.target.checked;
+          document.getElementById("chat-mode-status").textContent = "保存 TinyLLM 设置失败";
+          document.getElementById("chat-mode-status").className = "status err";
+        });
+    });
+
+    const modelDiscoveryTimers = {};
+    const modelDiscoveryFields = {
+      audit: {
+        apiBase: "audit-api-base",
+        apiKey: "audit-api-key",
+        model: "audit-model",
+        options: "audit-model-options",
+        status: "audit-model-discovery",
+      },
+      remote_llm: {
+        apiBase: "remote-llm-api-base",
+        apiKey: "remote-llm-api-key",
+        model: "remote-llm-model",
+        options: "remote-llm-model-options",
+        status: "remote-llm-model-discovery",
+      },
+    };
+
+    function scheduleModelDiscovery(scope, delay = 600, useSavedKey = false) {
+      const fields = modelDiscoveryFields[scope];
+      if (!fields) return;
+      clearTimeout(modelDiscoveryTimers[scope]);
+      modelDiscoveryTimers[scope] = setTimeout(() => discoverModels(scope, useSavedKey), delay);
+    }
+
+    function discoverModels(scope, useSavedKey = false) {
+      const fields = modelDiscoveryFields[scope];
+      if (!fields) return;
+      const apiBaseEl = document.getElementById(fields.apiBase);
+      const apiKeyEl = document.getElementById(fields.apiKey);
+      const modelEl = document.getElementById(fields.model);
+      const optionsEl = document.getElementById(fields.options);
+      const statusEl = document.getElementById(fields.status);
+      const apiBase = apiBaseEl?.value.trim() || "";
+      const apiKey = apiKeyEl?.value.trim() || "";
+      if (!apiBase || (!apiKey && !useSavedKey)) {
+        if (statusEl) statusEl.textContent = "填写 API Base 和 Key 后自动获取模型。";
+        return;
+      }
+      if (statusEl) statusEl.textContent = "正在获取模型…";
+      fetch("/api/settings/models", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({scope, api_base: apiBase, api_key: apiKey, use_saved_key: useSavedKey}),
+      })
+        .then(r => r.json())
+        .then(data => {
+          if (!data.ok) throw new Error(data.error || "获取失败");
+          const models = Array.isArray(data.models) ? data.models : [];
+          if (optionsEl) {
+            optionsEl.replaceChildren(...models.map(model => {
+              const option = document.createElement("option");
+              option.value = model;
+              return option;
+            }));
+          }
+          if (modelEl && models.length && (!modelEl.value.trim() || modelEl.value.trim() === "gpt-4o-mini")) {
+            modelEl.value = models[0];
+          }
+          if (statusEl) statusEl.textContent = `已获取 ${models.length} 个模型。`;
+        })
+        .catch(err => {
+          if (statusEl) {
+            const message = String(err).replace(/^Error:\\s*/, "");
+            statusEl.textContent = "获取模型失败：" + message;
+            statusEl.className = "settings-note err";
+          }
+        });
+    }
+
+    ["audit", "remote_llm"].forEach(scope => {
+      const fields = modelDiscoveryFields[scope];
+      [fields.apiBase, fields.apiKey].forEach(id => {
+        document.getElementById(id)?.addEventListener("input", () => scheduleModelDiscovery(scope));
+        document.getElementById(id)?.addEventListener("change", () => scheduleModelDiscovery(scope, 0));
+      });
+    });
 
     document.getElementById("remote-llm-save-btn").addEventListener("click", () => {
       const btn = document.getElementById("remote-llm-save-btn");
@@ -11432,6 +15033,29 @@ INDEX_HTML = r"""<!doctype html>
       message.value = "/chat_mode api_llm";
       settingsOverlay.classList.remove("open");
       sendChat();
+    });
+
+    document.getElementById("chat-mode-save-btn").addEventListener("click", () => {
+      const button = document.getElementById("chat-mode-save-btn");
+      const statusEl = document.getElementById("chat-mode-status");
+      const mode = document.getElementById("chat-mode-select").value;
+      if (!mode) return;
+      button.disabled = true;
+      fetch("/api/chat/mode", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({mode}),
+      }).then(r => r.json()).then(data => {
+        if (!data.ok) throw new Error(data.error || "切换失败");
+        statusEl.textContent = "已切换到：" + (data.name || mode);
+        statusEl.className = "status ok";
+        loadSettings();
+      }).catch(err => {
+        statusEl.textContent = "切换失败：" + String(err).replace(/^Error:\\s*/, "");
+        statusEl.className = "status err";
+      }).finally(() => {
+        button.disabled = false;
+      });
     });
 
     // TTS 滑块实时更新
@@ -11647,10 +15271,41 @@ INDEX_HTML = r"""<!doctype html>
 
     document.getElementById("ocr-install-btn").addEventListener("click", () => installComponent("ocr"));
     document.getElementById("torch-install-btn").addEventListener("click", () => installComponent("torch"));
+    document.getElementById("torch-dx12-train-btn")?.addEventListener("click", () => {
+      const btn = document.getElementById("torch-dx12-train-btn");
+      const status = document.getElementById("torch-dx12-status");
+      if (!btn || !status) return;
+      const label = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "DX12 训练中…";
+      status.textContent = "正在使用 DirectX 12 (DirectML) 训练内置动作模型…";
+      status.className = "settings-note";
+      fetch("/api/neural/train", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({backend: "directml"}),
+      })
+        .then(r => r.json())
+        .then(data => {
+          if (!data.ok) throw new Error(data.error || "训练失败");
+          status.textContent = `DX12 训练完成：${data.examples || 0} 条样本，loss ${data.loss ?? "-"}`;
+          status.className = "settings-note status ok";
+        })
+        .catch(err => {
+          status.textContent = "DX12 训练失败：" + String(err).replace(/^Error:\\s*/, "");
+          status.className = "settings-note status err";
+        })
+        .finally(() => {
+          btn.textContent = label;
+          loadSettings();
+        });
+    });
     document.getElementById("zluda-install-btn").addEventListener("click", () => installComponent("zluda"));
     document.getElementById("opencv-install-btn").addEventListener("click", () => installComponent("opencv"));
     document.getElementById("datasets-install-btn").addEventListener("click", () => installComponent("datasets"));
     document.getElementById("python-install-btn").addEventListener("click", installPython);
+    document.getElementById("cpp-toolchain-install-btn").addEventListener("click", () => runCppToolchainAction("cpp_toolchain", "cpp-toolchain-install-btn", "下载并安装 LLVM"));
+    document.getElementById("cpp-toolchain-path-btn").addEventListener("click", () => runCppToolchainAction("cpp_toolchain_path", "cpp-toolchain-path-btn", "加入已有目录到 PATH"));
     document.getElementById("shortcuts-uninstall-btn").addEventListener("click", () => uninstallComponent("shortcuts"));
     document.getElementById("camera-test-btn").addEventListener("click", () => {
       const resultEl = document.getElementById("camera-test-result");
@@ -11858,8 +15513,11 @@ INDEX_HTML = r"""<!doctype html>
           const id = data.identity;
           let text = '名字：' + (id.name || '未设置');
           const relationLabels = {friend: '朋友', family: '家人', partner: '搭档', guardian: '守护者', lifeform: '虚拟生命'};
+          const subtypeLabels = {friend: '普通朋友', close_friend: '挚友', best_friend: '最好的朋友', classmate: '同学', childhood_friend: '青梅竹马', online_friend: '网友', daughter: '女儿', son: '儿子', mother: '母亲', father: '父亲', parent: '父母', older_sister: '姐姐', older_brother: '哥哥', younger_sister: '妹妹', younger_brother: '弟弟', family_member: '其他家人', study_partner: '学习搭子', work_partner: '工作搭档', creative_partner: '创作搭档', game_partner: '游戏搭子', accountability_partner: '互助伙伴', health_guardian: '健康守护者', routine_guardian: '作息守护者', emotion_guardian: '情绪守护者', safety_guardian: '安全提醒者', learning_lifeform: '学习型数字生命', explorer_lifeform: '探索型数字生命', companion_lifeform: '陪伴型数字生命', assistant_lifeform: '助理型数字生命'};
           const relationshipLabel = id.relationship_type === 'custom'
             ? (id.relationship_label || '自定义关系')
+            : subtypeLabels[id.relationship_subtype]
+              ? subtypeLabels[id.relationship_subtype]
             : (relationLabels[id.relationship_type] || id.relationship_label || '朋友');
           text += ' | 关系：' + relationshipLabel;
           if (id.gender) text += ' | 性别：' + id.gender;
@@ -12071,6 +15729,9 @@ INDEX_HTML = r"""<!doctype html>
     const obRelationship = document.getElementById('ob-relationship');
     const obRomanceEvolutionGroup = document.getElementById('ob-romance-evolution-group');
     const obRomanceEvolution = document.getElementById('ob-romance-evolution');
+    const obRelationshipSubtypeGroup = document.getElementById('ob-relationship-subtype-group');
+    const obRelationshipSubtype = document.getElementById('ob-relationship-subtype');
+    const obRelationshipSubtypeLabel = document.getElementById('ob-relationship-subtype-label');
     const obCustomRelationshipGroup = document.getElementById('ob-custom-relationship-group');
     const obCustomRelationship = document.getElementById('ob-custom-relationship');
     const obBirthday = document.getElementById('ob-birthday');
@@ -12091,19 +15752,44 @@ INDEX_HTML = r"""<!doctype html>
       }).catch(() => {});
     }
 
+    const relationshipSubtypeOptions = {
+      friend: [['friend', '普通朋友'], ['close_friend', '挚友'], ['best_friend', '最好的朋友'], ['classmate', '同学'], ['childhood_friend', '青梅竹马'], ['online_friend', '网友']],
+      family: [['daughter', '女儿'], ['son', '儿子'], ['mother', '母亲'], ['father', '父亲'], ['parent', '父母'], ['older_sister', '姐姐'], ['older_brother', '哥哥'], ['younger_sister', '妹妹'], ['younger_brother', '弟弟'], ['family_member', '其他家人']],
+      partner: [['study_partner', '学习搭子'], ['work_partner', '工作搭档'], ['creative_partner', '创作搭档'], ['game_partner', '游戏搭子'], ['accountability_partner', '互助伙伴']],
+      guardian: [['health_guardian', '健康守护者'], ['routine_guardian', '作息守护者'], ['emotion_guardian', '情绪守护者'], ['safety_guardian', '安全提醒者']],
+      lifeform: [['learning_lifeform', '学习型数字生命'], ['explorer_lifeform', '探索型数字生命'], ['companion_lifeform', '陪伴型数字生命'], ['assistant_lifeform', '助理型数字生命']],
+    };
+    const relationshipSubtypeTitles = {friend: '朋友类型', family: '家人身份', partner: '搭档类型', guardian: '守护方向', lifeform: '生命类型'};
+
     function syncCustomRelationshipInput(options = {}) {
       const isCustom = obRelationship.value === 'custom';
       const isFriend = obRelationship.value === 'friend';
+      const subtypes = relationshipSubtypeOptions[obRelationship.value] || [];
+      const previousSubtype = obRelationshipSubtype.value;
       obCustomRelationshipGroup.style.display = isCustom ? 'block' : 'none';
       obRomanceEvolutionGroup.style.display = isFriend ? 'block' : 'none';
+      obRelationshipSubtypeGroup.style.display = subtypes.length ? 'block' : 'none';
       obCustomRelationship.required = isCustom;
+      obRelationshipSubtype.required = subtypes.length > 0;
       obCustomRelationship.setAttribute('aria-hidden', isCustom ? 'false' : 'true');
+      obRelationshipSubtype.setAttribute('aria-hidden', subtypes.length ? 'false' : 'true');
+      if (subtypes.length) {
+        obRelationshipSubtypeLabel.textContent = relationshipSubtypeTitles[obRelationship.value] || '具体身份';
+        obRelationshipSubtype.replaceChildren(...subtypes.map(([value, label]) => {
+          const option = document.createElement('option');
+          option.value = value;
+          option.textContent = label;
+          return option;
+        }));
+        obRelationshipSubtype.value = subtypes.some(([value]) => value === previousSubtype) ? previousSubtype : subtypes[0][0];
+      }
       if (isCustom && options.focus) {
         obCustomRelationship.focus();
       }
       if (!isCustom) {
         obCustomRelationship.style.borderColor = '';
       }
+      obRelationshipSubtype.style.borderColor = '';
     }
 
     // Relationship type change -> show/hide custom input
@@ -12178,6 +15864,12 @@ INDEX_HTML = r"""<!doctype html>
         }
         obCustomRelationship.style.borderColor = '';
       }
+      if (relationshipSubtypeOptions[obRelationship.value] && !obRelationshipSubtype.value) {
+        obRelationshipSubtype.style.borderColor = '#e03e3e';
+        obRelationshipSubtype.focus();
+        return;
+      }
+      obRelationshipSubtype.style.borderColor = '';
       obSubmit.disabled = true;
       obSubmit.textContent = '保存中...';
       try {
@@ -12190,6 +15882,7 @@ INDEX_HTML = r"""<!doctype html>
             name: name,
             relationship_type: obRelationship.value,
             relationship_label: obRelationship.value === 'custom' ? obCustomRelationship.value.trim() : '',
+            relationship_subtype: relationshipSubtypeOptions[obRelationship.value] ? obRelationshipSubtype.value : '',
             allow_romance_evolution: obRelationship.value === 'friend' ? obRomanceEvolution.checked : false,
             gender: gender,
             birthday: obBirthday.value,
@@ -12223,6 +15916,7 @@ INDEX_HTML = r"""<!doctype html>
         obName.value = id.name || '';
         obRelationship.value = id.relationship_type || 'friend';
         obCustomRelationship.value = id.relationship_label || '';
+        obRelationshipSubtype.value = id.relationship_subtype || '';
         obRomanceEvolution.checked = id.allow_romance_evolution !== false;
         syncCustomRelationshipInput();
         obBirthday.value = id.birthday || '';
@@ -12241,140 +15935,269 @@ INDEX_HTML = r"""<!doctype html>
     const tourOverlay = document.getElementById('tour-overlay');
     const tourHighlight = document.getElementById('tour-highlight');
     const tourTooltip = document.getElementById('tour-tooltip');
+    const tourKicker = document.getElementById('tour-kicker');
     const tourTitle = document.getElementById('tour-title');
     const tourDesc = document.getElementById('tour-desc');
     const tourProgress = document.getElementById('tour-progress');
     const tourSkip = document.getElementById('tour-skip');
+    const tourPrev = document.getElementById('tour-prev');
     const tourNext = document.getElementById('tour-next');
-    
+
     let currentTourStep = 0;
-    
+
     const tourSteps = [
       {
-        targetId: 'message',
-        title: '聊天输入框',
-        desc: '在这里输入你想说的话，和你的 AI 桌宠进行对话。',
-        position: 'bottom'
-      },
-      {
-        targetId: 'avatar',
-        title: 'AI 桌宠',
-        desc: '这是你的 AI 桌宠，它会根据对话内容做出不同的表情和动作。',
+        targetId: 'new-chat-btn',
+        title: '从一段新对话开始',
+        desc: '需要换一个话题时，点击这里创建新的对话。已有内容会保留在左侧的最近对话中。',
         position: 'right'
       },
       {
+        targetId: 'message',
+        title: '把想法告诉 Companion',
+        desc: '直接输入问题、目标或近况。附件、网页和更多输入选项都在输入框下方。',
+        position: 'top'
+      },
+      {
         targetId: 'memory-orbit',
-        title: '长期记忆',
-        desc: 'AI 会记住你们的对话内容，形成长期记忆，让对话更加自然。',
+        title: '查看陪伴上下文',
+        desc: '这里汇总当前记忆、文件和常用动作。需要时展开它，聊天空间会保持干净。',
         position: 'left'
       },
       {
         targetId: 'settings-btn',
-        title: '设置按钮',
-        desc: '点击这里可以设置 AI 的身份信息、语音、插件等配置。',
+        title: '按自己的方式设置',
+        desc: '在这里管理身份、显示、语音、桌宠和本地数据。随时可以回来调整。',
         position: 'bottom'
-      },
-      {
-        targetId: 'quick',
-        title: '快捷命令',
-        desc: '这里有各种快捷功能按钮，包括观察屏幕、查看天气、OCR 识别等。',
-        position: 'right'
       }
     ];
-    
-    function startGuidedTour() {
+
+    function startGuidedTour(options = {}) {
       const hasDoneTour = localStorage.getItem('companion_ai_tour_done');
-      if (hasDoneTour) return;
+      if (hasDoneTour && !options.force) return;
       currentTourStep = 0;
-      showTourStep(0);
+      showTourStep(currentTourStep, { scroll: true });
     }
-    
-    function showTourStep(index) {
+
+    function getTourTarget(step) {
+      return document.getElementById(step.targetId);
+    }
+
+    function positionTourTooltip(rect, position) {
+      const padding = 16;
+      const gap = 16;
+      const tooltipRect = tourTooltip.getBoundingClientRect();
+      let left = rect.left;
+      let top = rect.bottom + gap;
+
+      if (position === 'top') {
+        left = rect.left + rect.width / 2 - tooltipRect.width / 2;
+        top = rect.top - tooltipRect.height - gap;
+      } else if (position === 'left') {
+        left = rect.left - tooltipRect.width - gap;
+        top = rect.top + rect.height / 2 - tooltipRect.height / 2;
+      } else if (position === 'right') {
+        left = rect.right + gap;
+        top = rect.top + rect.height / 2 - tooltipRect.height / 2;
+      } else {
+        left = rect.left + rect.width / 2 - tooltipRect.width / 2;
+      }
+
+      left = Math.max(padding, Math.min(left, window.innerWidth - tooltipRect.width - padding));
+      top = Math.max(padding, Math.min(top, window.innerHeight - tooltipRect.height - padding));
+      tourTooltip.style.left = `${Math.round(left)}px`;
+      tourTooltip.style.top = `${Math.round(top)}px`;
+    }
+
+    function showTourStep(index, options = {}) {
+      if (index < 0) return;
       if (index >= tourSteps.length) {
         endTour();
         return;
       }
       currentTourStep = index;
       const step = tourSteps[index];
-      const target = document.getElementById(step.targetId);
-      
+      const target = getTourTarget(step);
+      if (!target) {
+        showTourStep(index + 1, options);
+        return;
+      }
+
+      if (options.scroll) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+        window.setTimeout(() => showTourStep(index), 260);
+        return;
+      }
+
+      const rect = target.getBoundingClientRect();
+      const inset = 6;
+      tourKicker.textContent = `快速开始 ${index + 1} / ${tourSteps.length}`;
       tourTitle.textContent = step.title;
       tourDesc.textContent = step.desc;
-      
-      tourProgress.innerHTML = '';
-      tourSteps.forEach((_, i) => {
-        const dot = document.createElement('div');
-        dot.className = 'tour-dot' + (i === index ? ' active' : '');
-        tourProgress.appendChild(dot);
-      });
-      
       tourNext.textContent = index === tourSteps.length - 1 ? '完成' : '下一步';
-      
-      if (target) {
-        const rect = target.getBoundingClientRect();
-        tourHighlight.style.left = rect.left + 'px';
-        tourHighlight.style.top = rect.top + 'px';
-        tourHighlight.style.width = rect.width + 'px';
-        tourHighlight.style.height = rect.height + 'px';
-        
-        const tooltipWidth = 340;
-        const tooltipHeight = 160;
-        let tooltipX, tooltipY;
-        
-        switch (step.position) {
-          case 'top':
-            tooltipX = rect.left + rect.width / 2 - tooltipWidth / 2;
-            tooltipY = rect.top - tooltipHeight - 20;
-            break;
-          case 'bottom':
-            tooltipX = rect.left + rect.width / 2 - tooltipWidth / 2;
-            tooltipY = rect.bottom + 20;
-            break;
-          case 'left':
-            tooltipX = rect.left - tooltipWidth - 20;
-            tooltipY = rect.top + rect.height / 2 - tooltipHeight / 2;
-            break;
-          case 'right':
-          default:
-            tooltipX = rect.right + 20;
-            tooltipY = rect.top + rect.height / 2 - tooltipHeight / 2;
-            break;
-        }
-        
-        tooltipX = Math.max(20, Math.min(tooltipX, window.innerWidth - tooltipWidth - 20));
-        tooltipY = Math.max(20, Math.min(tooltipY, window.innerHeight - tooltipHeight - 20));
-        
-        tourTooltip.style.left = tooltipX + 'px';
-        tourTooltip.style.top = tooltipY + 'px';
-        tourTooltip.className = 'tour-tooltip ' + step.position;
-      } else {
-        tourHighlight.style.display = 'none';
-        tourTooltip.style.left = '50%';
-        tourTooltip.style.top = '50%';
-        tourTooltip.style.transform = 'translate(-50%, -50%)';
-        tourTooltip.className = 'tour-tooltip';
-      }
-      
+      tourPrev.disabled = index === 0;
+      tourProgress.replaceChildren(...tourSteps.map((_, stepIndex) => {
+        const dot = document.createElement('span');
+        dot.className = `tour-dot${stepIndex === index ? ' active' : ''}`;
+        return dot;
+      }));
+
+      tourHighlight.style.display = 'block';
+      tourHighlight.style.left = `${Math.round(rect.left - inset)}px`;
+      tourHighlight.style.top = `${Math.round(rect.top - inset)}px`;
+      tourHighlight.style.width = `${Math.round(rect.width + inset * 2)}px`;
+      tourHighlight.style.height = `${Math.round(rect.height + inset * 2)}px`;
       tourOverlay.classList.remove('hidden');
+      positionTourTooltip(rect, step.position);
     }
-    
+
     function nextTourStep() {
-      showTourStep(currentTourStep + 1);
+      showTourStep(currentTourStep + 1, { scroll: true });
     }
-    
+
+    function previousTourStep() {
+      showTourStep(currentTourStep - 1, { scroll: true });
+    }
+
     function endTour() {
       tourOverlay.classList.add('hidden');
+      tourHighlight.style.display = 'none';
       localStorage.setItem('companion_ai_tour_done', 'true');
     }
-    
+
+    function repositionTour() {
+      if (!tourOverlay.classList.contains('hidden')) showTourStep(currentTourStep);
+    }
+
     tourNext.addEventListener('click', nextTourStep);
+    tourPrev.addEventListener('click', previousTourStep);
     tourSkip.addEventListener('click', endTour);
-    
-    tourOverlay.addEventListener('click', (e) => {
-      if (e.target === tourOverlay) {
-        nextTourStep();
-      }
+    tourOverlay.addEventListener('click', event => {
+      if (event.target === tourOverlay) endTour();
     });
+    document.addEventListener('keydown', event => {
+      if (tourOverlay.classList.contains('hidden')) return;
+      if (event.key === 'Escape') endTour();
+      if (event.key === 'ArrowRight' || event.key === 'Enter') nextTourStep();
+      if (event.key === 'ArrowLeft') previousTourStep();
+    });
+    window.addEventListener('resize', repositionTour);
+    window.addEventListener('scroll', repositionTour, true);
+    window.startGuidedTour = () => startGuidedTour({ force: true });
+  </script>
+  <script>
+    // Keep onboarding available even if an optional page integration fails during startup.
+    (() => {
+      const overlay = document.getElementById('tour-overlay');
+      const highlight = document.getElementById('tour-highlight');
+      const tooltip = document.getElementById('tour-tooltip');
+      const kicker = document.getElementById('tour-kicker');
+      const title = document.getElementById('tour-title');
+      const desc = document.getElementById('tour-desc');
+      const progress = document.getElementById('tour-progress');
+      const skip = document.getElementById('tour-skip');
+      const previous = document.getElementById('tour-prev');
+      const next = document.getElementById('tour-next');
+      if (!overlay || !highlight || !tooltip || !kicker || !title || !desc || !progress || !skip || !previous || !next) return;
+
+      const steps = [
+        ['new-chat-btn', '从一段新对话开始', '需要换一个话题时，点击这里创建新的对话。已有内容会保留在左侧的最近对话中。', 'right'],
+        ['message', '把想法告诉 Companion', '直接输入问题、目标或近况。附件、网页和更多输入选项都在输入框下方。', 'top'],
+        ['memory-orbit', '查看陪伴上下文', '这里汇总当前记忆、文件和常用动作。需要时展开它，聊天空间会保持干净。', 'left'],
+        ['settings-btn', '按自己的方式设置', '在这里管理身份、显示、语音、桌宠和本地数据。随时可以回来调整。', 'bottom'],
+      ];
+      let activeStep = 0;
+
+      function finish() {
+        overlay.classList.add('hidden');
+        highlight.style.display = 'none';
+        localStorage.setItem('companion_ai_tour_done', 'true');
+      }
+
+      function placeTooltip(rect, position) {
+        const margin = 16;
+        const gap = 16;
+        const card = tooltip.getBoundingClientRect();
+        let left = rect.left + rect.width / 2 - card.width / 2;
+        let top = rect.bottom + gap;
+        if (position === 'top') top = rect.top - card.height - gap;
+        if (position === 'left') { left = rect.left - card.width - gap; top = rect.top + rect.height / 2 - card.height / 2; }
+        if (position === 'right') { left = rect.right + gap; top = rect.top + rect.height / 2 - card.height / 2; }
+        tooltip.style.left = `${Math.round(Math.max(margin, Math.min(left, window.innerWidth - card.width - margin)))}px`;
+        tooltip.style.top = `${Math.round(Math.max(margin, Math.min(top, window.innerHeight - card.height - margin)))}px`;
+      }
+
+      function render(index, scroll = true) {
+        if (index < 0) return;
+        if (index >= steps.length) { finish(); return; }
+        const step = steps[index];
+        const target = document.getElementById(step[0]);
+        if (!target) { render(index + 1, scroll); return; }
+        activeStep = index;
+        if (scroll) {
+          target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+          window.setTimeout(() => render(index, false), 260);
+          return;
+        }
+        const rect = target.getBoundingClientRect();
+        const inset = 6;
+        kicker.textContent = `快速开始 ${index + 1} / ${steps.length}`;
+        title.textContent = step[1];
+        desc.textContent = step[2];
+        previous.disabled = index === 0;
+        next.textContent = index === steps.length - 1 ? '完成' : '下一步';
+        progress.replaceChildren(...steps.map((_, i) => {
+          const dot = document.createElement('span');
+          dot.className = `tour-dot${i === index ? ' active' : ''}`;
+          return dot;
+        }));
+        highlight.style.display = 'block';
+        highlight.style.left = `${Math.round(rect.left - inset)}px`;
+        highlight.style.top = `${Math.round(rect.top - inset)}px`;
+        highlight.style.width = `${Math.round(rect.width + inset * 2)}px`;
+        highlight.style.height = `${Math.round(rect.height + inset * 2)}px`;
+        overlay.classList.remove('hidden');
+        placeTooltip(rect, step[3]);
+      }
+
+      function start(force = false) {
+        if (!force && localStorage.getItem('companion_ai_tour_done')) return;
+        render(0);
+      }
+
+      next.addEventListener('click', event => { event.stopImmediatePropagation(); render(activeStep + 1); }, true);
+      previous.addEventListener('click', event => { event.stopImmediatePropagation(); render(activeStep - 1); }, true);
+      skip.addEventListener('click', event => { event.stopImmediatePropagation(); finish(); }, true);
+      overlay.addEventListener('click', event => { if (event.target === overlay) finish(); });
+      document.addEventListener('keydown', event => {
+        if (overlay.classList.contains('hidden')) return;
+        if (event.key === 'Escape') finish();
+        if (event.key === 'ArrowRight' || event.key === 'Enter') render(activeStep + 1);
+        if (event.key === 'ArrowLeft') render(activeStep - 1);
+      });
+      window.addEventListener('resize', () => { if (!overlay.classList.contains('hidden')) render(activeStep, false); });
+      window.addEventListener('scroll', () => { if (!overlay.classList.contains('hidden')) render(activeStep, false); }, true);
+      window.startGuidedTour = () => start(true);
+      document.getElementById('tour-restart-btn')?.addEventListener('click', () => start(true));
+      fetch('/api/identity').then(response => response.json()).then(data => {
+        if (data.setup_done) start(false);
+      }).catch(() => {});
+    })();
+
+    // Scrollbar visibility: hidden by default, shown when scrolling.
+    (function () {
+      let scrollTimer = null;
+      function showScrolling() {
+        document.body.classList.add('is-scrolling');
+        if (scrollTimer) clearTimeout(scrollTimer);
+        scrollTimer = setTimeout(() => {
+          document.body.classList.remove('is-scrolling');
+        }, 600);
+      }
+      window.addEventListener('scroll', showScrolling, true);
+      document.addEventListener('wheel', showScrolling, { capture: true, passive: true });
+      document.addEventListener('touchmove', showScrolling, { capture: true, passive: true });
+    })();
   </script>
 </body>
 </html>"""
@@ -12600,6 +16423,80 @@ SECONDARY_PAGE_HTML = r"""<!doctype html>
     .entry-head, .moment-meta { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
     .moment-content { white-space: pre-wrap; }
     .moment-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .moment-image-wrap {
+      margin: 10px 0;
+      border-radius: var(--ui-radius);
+      overflow: hidden;
+      background: color-mix(in srgb, var(--panel-soft) 40%, transparent);
+    }
+    .moment-image {
+      width: 100%;
+      height: auto;
+      display: block;
+      max-height: 480px;
+      object-fit: cover;
+      cursor: pointer;
+      transition: transform .2s ease;
+    }
+    .moment-image:hover {
+      transform: scale(1.02);
+    }
+    .moment-comments-section {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
+    }
+    .moment-comments-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+    .moment-comment {
+      padding: 8px 10px;
+      border-radius: calc(var(--ui-radius) - 2px);
+      background: color-mix(in srgb, var(--panel-soft) 60%, transparent);
+    }
+    .moment-comment-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 4px;
+    }
+    .moment-comment-text {
+      font-size: 13px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    .moment-comment-input-row {
+      display: flex;
+      gap: 8px;
+    }
+    .moment-comment-input {
+      flex: 1;
+      min-height: 36px;
+      padding: 0 10px;
+      border: 0;
+      border-radius: calc(var(--ui-radius) - 2px);
+      background: color-mix(in srgb, var(--panel-soft) 60%, transparent);
+      color: var(--ink);
+      font: inherit;
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--line) 30%, transparent);
+    }
+    .moment-comment-input:focus {
+      outline: none;
+      box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 50%, transparent);
+    }
+    .moment-comment-send {
+      padding: 0 14px;
+      border: 0;
+      border-radius: calc(var(--ui-radius) - 2px);
+      background: var(--accent);
+      color: white;
+      font: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .moment-comment-send:hover {
+      filter: brightness(1.08);
+    }
     .moments-feed {
       margin-top: 0;
       max-height: 520px;
@@ -12934,6 +16831,9 @@ SECONDARY_PAGE_HTML = r"""<!doctype html>
             <button type="button" data-command="/self_study_add C语言入门教程,C++ STL,菜鸟教程 C语言">添加主题</button>
             <button type="button" data-command="/self_study_set 1 => C语言 指针和内存">修改主题</button>
             <button type="button" data-command="/self_study_del 1">删除主题</button>
+            <button type="button" data-command="/self_study_topic 科技新闻,人工智能,网络安全,健康知识">批量设置主题</button>
+            <button type="button" data-command="/self_study_min 1">最低间隔 1 小时</button>
+            <button type="button" data-command="/self_study_max 24">最大间隔 24 小时</button>
             <button type="button" data-command="/idle_explore">闲置探索状态</button>
             <button type="button" data-command="/idle_explore_on">开启闲置探索</button>
             <button type="button" data-command="/idle_explore_off">关闭闲置探索</button>
@@ -12954,6 +16854,12 @@ SECONDARY_PAGE_HTML = r"""<!doctype html>
           <article class="card tool-card">
             <div class="step">06</div><h3>模型与训练</h3><p>低频训练和模型管理入口。</p>
             <button type="button" class="primary" data-command="/train_tiny">训练 Tiny LLM</button>
+            <button type="button" data-command="/train_sparse">训练稀疏 Tiny LLM</button>
+            <button type="button" data-command="/train_pangu_pi">训练盘古π稀疏 LLM</button>
+            <button type="button" data-command="/algorithm_curriculum">算法课程状态</button>
+            <button type="button" data-command="/algorithm_curriculum_status">查看算法课程</button>
+            <button type="button" data-command="/algorithm_curriculum_dataset">导出算法数据集</button>
+            <button type="button" data-command="/algorithm_curriculum_train 5">算法课程训练 5 轮</button>
             <button type="button" data-command="/llm">本地 LLM</button>
             <button type="button" data-command="/code_lab">代码练习场</button>
             <button type="button" data-command="/code_run python => print('hello code lab')">运行 Python 示例</button>
@@ -12975,10 +16881,23 @@ SECONDARY_PAGE_HTML = r"""<!doctype html>
             <button type="button" data-command="/export_model">生成模型</button>
           </article>
           <article class="card tool-card">
-            <div class="step">07</div><h3>个人上下文</h3><p>画像、作息、关系和技能管理。</p>
+            <div class="step">07</div><h3>梦境引擎</h3><p>AI 在空闲时后台自我学习、记忆整理与技能刷题。</p>
+            <button type="button" class="primary" data-command="/dream_status">梦境状态</button>
+            <button type="button" data-command="/dream_on">开启梦境引擎</button>
+            <button type="button" data-command="/dream_off">关闭梦境引擎</button>
+            <button type="button" data-command="/dream_now">立即整理记忆</button>
+            <button type="button" data-command="/dream_practice">立即刷题</button>
+            <button type="button" data-command="/dream_skills">已掌握技能</button>
+            <button type="button" data-command="/distill_status">知识蒸馏状态</button>
+            <button type="button" data-command="/distill_now">立即知识蒸馏</button>
+          </article>
+          <article class="card tool-card">
+            <div class="step">08</div><h3>个人上下文</h3><p>画像、作息、关系和技能管理。</p>
             <button type="button" class="primary" data-command="/profile">用户画像</button>
+            <button type="button" data-command="/name ">设置称呼</button>
             <button type="button" data-command="/profile_on">开启画像</button>
             <button type="button" data-command="/profile_off">关闭画像</button>
+            <button type="button" data-command="/profile_clear">清除画像数据</button>
             <button type="button" data-command="/growth">关系成长</button>
             <button type="button" data-command="/relationship">关系状态</button>
             <button type="button" data-command="/personality">性格成长</button>
@@ -13000,6 +16919,7 @@ SECONDARY_PAGE_HTML = r"""<!doctype html>
             <button type="button" data-command="/weather Hong Kong">查看天气</button>
             <button type="button" data-command="/startup_on">开启开机自启</button>
             <button type="button" data-command="/startup_off">关闭开机自启</button>
+            <button type="button" data-command="/audit_recent">最近审计记录</button>
           </article>
           <article class="card tool-card">
             <div class="step">09</div><h3>电脑操作学习</h3><p>学习常用电脑操作流程，并生成可执行步骤。</p>
@@ -13179,7 +17099,7 @@ SECONDARY_PAGE_HTML = r"""<!doctype html>
         const resp = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: command, url: "", file_id: "" })
+          body: JSON.stringify({ message: command, url: "", file_id: "", persist_history: pageKind !== "tools" && pageKind !== "samples" && pageKind !== "diary" })
         });
         const data = await resp.json();
         if (pageKind === "tools") {
@@ -13328,29 +17248,75 @@ SECONDARY_PAGE_HTML = r"""<!doctype html>
         list.innerHTML = '<div class="entry empty">还没有动态。</div>';
         return;
       }
-      list.innerHTML = posts.map(post => `
+      list.innerHTML = posts.map(post => {
+        const comments = post.comments || [];
+        return `
         <article class="moment-post" data-id="${escapeText(post.id)}">
           <div class="moment-meta"><strong>${escapeText(post.author || "Companion AI")}</strong><span>${escapeText(formatMomentTime(post.created_at))}</span></div>
           <div class="moment-content">${escapeText(post.content)}</div>
+          ${post.image_url ? `<div class="moment-image-wrap"><img class="moment-image" src="${escapeText(post.image_url)}" alt="心情卡片" loading="lazy" /></div>` : ""}
           ${post.mood ? `<div class="empty">${escapeText(post.mood)}</div>` : ""}
           <div class="moment-actions">
             <button type="button" data-moment-action="like" data-liked="${post.liked_by_user ? "1" : "0"}">${post.liked_by_user ? "已赞" : "赞"} ${post.likes || 0}</button>
-            <button type="button" data-moment-action="comment">评论</button>
+            <button type="button" data-moment-action="toggle-comment">评论 ${comments.length ? `(${comments.length})` : ""}</button>
             <button type="button" data-moment-action="delete">删除</button>
           </div>
+          <div class="moment-comments-section" hidden>
+            <div class="moment-comments-list">
+              ${comments.length ? comments.map(c => `
+                <div class="moment-comment">
+                  <div class="moment-comment-meta"><strong>${escapeText(c.author || "你")}</strong><span>${escapeText(formatMomentTime(c.created_at))}</span></div>
+                  <div class="moment-comment-text">${escapeText(c.text)}</div>
+                </div>
+              `).join("") : '<div class="empty">还没有评论，来抢沙发吧~</div>'}
+            </div>
+            <div class="moment-comment-input-row">
+              <input type="text" class="moment-comment-input" placeholder="写评论..." maxlength="300" />
+              <button type="button" class="moment-comment-send">发送</button>
+            </div>
+          </div>
         </article>
-      `).join("");
+      `;
+      }).join("");
       list.querySelectorAll("[data-moment-action]").forEach(btn => {
         btn.addEventListener("click", () => {
           const card = btn.closest("[data-id]");
           const id = card?.dataset.id || "";
           const action = btn.dataset.momentAction;
           if (action === "like") updateMoment({ action: "like", id, liked: btn.dataset.liked !== "1" });
-          if (action === "comment") {
-            const text = prompt("写评论：");
-            if (text) updateMoment({ action: "comment", id, text });
+          if (action === "toggle-comment") {
+            const section = card.querySelector(".moment-comments-section");
+            if (section) {
+              section.hidden = !section.hidden;
+              if (!section.hidden) {
+                const input = section.querySelector(".moment-comment-input");
+                if (input) input.focus();
+              }
+            }
           }
           if (action === "delete" && confirm("删除这条动态？")) updateMoment({ action: "delete", id });
+        });
+      });
+      list.querySelectorAll(".moment-comment-send").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const card = btn.closest("[data-id]");
+          const input = card?.querySelector(".moment-comment-input");
+          const text = input?.value?.trim();
+          const id = card?.dataset.id || "";
+          if (!text) return;
+          updateMoment({ action: "comment", id, text });
+        });
+      });
+      list.querySelectorAll(".moment-comment-input").forEach(input => {
+        input.addEventListener("keydown", e => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            const card = input.closest("[data-id]");
+            const text = input.value.trim();
+            const id = card?.dataset.id || "";
+            if (!text) return;
+            updateMoment({ action: "comment", id, text });
+          }
         });
       });
     }
@@ -13629,10 +17595,9 @@ def handle_pet_display_post(payload: dict) -> dict:
 
 
 def demo_scene_payload(scene: str) -> dict:
-    configure_relationship("family")
+    configure_relationship("family", relationship_subtype="daughter")
     scene = scene if scene in {"day1", "day4", "day7"} else "day1"
     store = load_growth()
-    store.setdefault("relationship_profile", {})["label"] = "AI 女儿"
     rel = store.setdefault("relationship", {})
     traits = store.setdefault("personality", {}).setdefault("traits", {})
     store.setdefault("events", [])
@@ -14375,6 +18340,20 @@ def _handle_settings_install(component: str, payload: dict = None) -> dict:
         except Exception as exc:
             return {"success": False, "detail": str(exc)[:200]}
 
+    elif component == "cpp_toolchain":
+        try:
+            from toolchain_manager import install_llvm
+            return install_llvm(str(payload.get("install_dir") or ""))
+        except Exception as exc:
+            return {"success": False, "detail": str(exc)[:400]}
+
+    elif component == "cpp_toolchain_path":
+        try:
+            from toolchain_manager import configure_existing_directory
+            return configure_existing_directory(str(payload.get("install_dir") or ""))
+        except Exception as exc:
+            return {"success": False, "detail": str(exc)[:400]}
+
     else:
         return {"success": False, "detail": f"未知组件: {component}"}
 
@@ -14391,6 +18370,33 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Private-Network", "true")
         self.end_headers()
         self.wfile.write(body)
+
+    def _lan_auth_ok(self) -> bool:
+        """Return True if the current request may perform write operations.
+
+        - Local-only mode (no LAN) always allows.
+        - Loopback clients always allow (same machine as the server).
+        - Non-loopback clients in LAN mode must present the pairing token via
+          the ``Authorization: Bearer <token>`` header or ``?lan_token=``
+          query parameter.
+        """
+        if not (ALLOW_LAN or HOST in {"0.0.0.0", "::"}):
+            return True
+        if _is_loopback_client(self.client_address):
+            return True
+        expected = lan_access_token()
+        if not expected:
+            return False
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].strip(), expected):
+            return True
+        # Query-string token form: /api/...?lan_token=...
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        candidate = (qs.get("lan_token") or [""])[0]
+        if candidate and hmac.compare_digest(candidate, expected):
+            return True
+        return False
 
     def do_OPTIONS(self) -> None:
         if self.path == "/api/local_access":
@@ -14445,17 +18451,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
             return
         if self.path == "/asset/ai_icon.ico":
-            icon_path = RES_ROOT / "ai_icon.ico"
-            if icon_path.exists():
-                self._send(200, icon_path.read_bytes(), "image/x-icon")
-                return
+            for icon_path in (RES_ROOT / "ai_icon.ico", ROOT / "ai_icon.ico", RES_ROOT / "pet_icon.ico", ROOT / "pet_icon.ico"):
+                if icon_path.exists():
+                    self._send(200, icon_path.read_bytes(), "image/x-icon")
+                    return
             self._send(404, b"not found", "text/plain")
             return
         if self.path == "/asset/pet_icon.ico":
-            icon_path = RES_ROOT / "pet_icon.ico"
-            if icon_path.exists():
-                self._send(200, icon_path.read_bytes(), "image/x-icon")
-                return
+            for icon_path in (RES_ROOT / "pet_icon.ico", ROOT / "pet_icon.ico", RES_ROOT / "ai_icon.ico", ROOT / "ai_icon.ico"):
+                if icon_path.exists():
+                    self._send(200, icon_path.read_bytes(), "image/x-icon")
+                    return
             self._send(404, b"not found", "text/plain")
             return
         if self.path.startswith("/static/"):
@@ -14473,6 +18479,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(404, b"not found", "text/plain")
             return
+        if self.path.startswith("/data_image/"):
+            rel = urllib.parse.unquote(self.path.removeprefix("/data_image/"))
+            fpath = (DATA_DIR / rel).resolve()
+            data_root = Path(DATA_DIR).resolve()
+            if data_root in fpath.parents and fpath.exists() and fpath.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif"):
+                ct = f"image/{fpath.suffix[1:]}"
+                if fpath.suffix.lower() == ".jpg":
+                    ct = "image/jpeg"
+                self._send(200, fpath.read_bytes(), ct)
+                return
+            self._send(404, b"not found", "text/plain")
+            return
         if self.path in {"/api/identity_confirmation", "/api/face/list", "/api/face/recognize", "/api/face/log", "/api/face/log/clear"} and not load_privacy_consent().get("accepted"):
             self._send(403, json.dumps({"ok": False, "error": "privacy consent required"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             return
@@ -14480,7 +18498,15 @@ class Handler(BaseHTTPRequestHandler):
             data = {"plugins": plugin_mgr.list_plugins()}
             self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         elif self.path == "/api/local_access":
-            self._send(200, json.dumps(local_access_info(), ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", cors=True)
+            self._send(200, json.dumps(local_access_info(loopback=_is_loopback_client(self.client_address)), ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", cors=True)
+        elif self.path == "/api/health":
+            self._send(200, json.dumps(health_check(), ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+        elif self.path == "/api/backup":
+            backups = []
+            if BACKUP_DIR.is_dir():
+                for f in sorted(BACKUP_DIR.glob("*.tar.gz"), reverse=True):
+                    backups.append({"name": f.name, "size": f.stat().st_size, "path": str(f)})
+            self._send(200, json.dumps({"ok": True, "backups": backups}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         elif self.path == "/api/i18n":
             self._send(200, json.dumps(app_i18n_payload(), ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         elif self.path == "/api/update":
@@ -14555,8 +18581,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/memory":
             data = {"memory": load_memory(), "training": load_training(), "files": load_files(), "avatar": avatar_state(), "growth": growth_payload()}
             self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+        elif self.path == "/api/recent_chats":
+            self._send(200, json.dumps({"ok": True, "chats": load_recent_chats()}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         elif self.path == "/api/moments":
-            self._send(200, json.dumps({"ok": True, "moments": load_moments()}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            self._send(200, json.dumps({"ok": True, "moments": _moments_with_image_urls(load_moments())}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         elif self.path == "/api/growth":
             data = {"ok": True, "growth": growth_payload(), "text": growth_status_text(), "events": events_text()}
             self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
@@ -14618,6 +18646,8 @@ class Handler(BaseHTTPRequestHandler):
                 opencv_ok, opencv_detail = _check_opencv_status()
                 tts_ok, tts_detail = _check_tts_status()
                 datasets_ok, datasets_detail = _check_datasets_status()
+                from toolchain_manager import status as cpp_toolchain_status
+                cpp_toolchain = cpp_toolchain_status()
                 gpu_info = _detect_gpu_detail()
                 if torch_ok and zluda_ok and "PyTorch 未安装" in zluda_detail:
                     backend = gpu_info.get("torch_backend")
@@ -14638,21 +18668,25 @@ class Handler(BaseHTTPRequestHandler):
                 data = {
                     "ocr": {"installed": ocr_ok, "detail": ocr_detail, "size": _get_component_size("ocr"), "removable": ocr_removable},
                     "torch": {"installed": torch_ok, "detail": torch_detail, "size": _get_component_size("torch"), "gpu": gpu_info},
+                    "neural": neural_status(),
                     "zluda": {"installed": zluda_ok, "detail": zluda_detail, "size": _get_component_size("zluda")},
                     "opencv": {"installed": opencv_ok, "detail": opencv_detail, "size": _get_component_size("opencv")},
                     "tts": {"installed": tts_ok, "detail": tts_detail, "size": _get_component_size("tts")},
                     "datasets": {"installed": datasets_ok, "detail": datasets_detail, "size": _get_component_size("datasets")},
                     "python": {"installed": python_ok, "detail": python_detail, "size": _get_component_size("python")},
+                    "cpp_toolchain": cpp_toolchain,
                 }
             except Exception as exc:
                 data = {
                     "ocr": {"installed": False, "detail": f"检测失败：{exc}", "size": "未知"},
                     "torch": {"installed": False, "detail": f"检测失败：{exc}", "size": "未知"},
+                    "neural": {"torch": {"available": False, "directml_available": False}},
                     "zluda": {"installed": False, "detail": f"检测失败：{exc}", "size": "未知"},
                     "opencv": {"installed": False, "detail": f"检测失败：{exc}", "size": "未知"},
                     "tts": {"installed": False, "detail": f"检测失败：{exc}", "size": "未知"},
                     "datasets": {"installed": False, "detail": f"检测失败：{exc}", "size": "未知"},
                     "python": {"installed": False, "detail": f"检测失败：{exc}", "size": "未知"},
+                    "cpp_toolchain": {"installed": False, "detail": f"检测失败：{exc}", "install_dir": ""},
                 }
             self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         elif self.path == "/api/settings/audit":
@@ -14681,6 +18715,48 @@ class Handler(BaseHTTPRequestHandler):
                 }, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             except Exception as exc:
                 self._send(500, json.dumps({"error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+        elif self.path == "/api/settings/growth":
+            try:
+                from growth_loop import growth_status, list_benchmarks
+                from growth_loop import list_experiences, list_model_versions
+                from image_growth import status as image_growth_status, list_recipes
+                from growth_jobs import status as training_job_status
+                from local_image_backend import load_config as load_image_backend_config, public_status as image_backend_status
+                self._send(200, json.dumps({
+                    "ok": True,
+                    "growth": growth_status(),
+                    "image": image_growth_status(),
+                    "benchmarks": list_benchmarks(),
+                    "versions": list_model_versions(),
+                    "experiences": list_experiences(40),
+                    "recipes": list_recipes(30),
+                    "training_job": training_job_status(),
+                    "image_backend": {**load_image_backend_config(), **image_backend_status(check_service=True)},
+                }, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+        elif self.path == "/api/settings/runtime":
+            try:
+                from dreaming_engine import get_dream_status, load_dream_config
+                from routine_tracker import is_autostart_enabled
+                self._send(200, json.dumps({
+                    "ok": True,
+                    "dream": load_dream_config(),
+                    "status": get_dream_status(),
+                    "autostart": is_autostart_enabled(),
+                }, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+        elif self.path == "/api/settings/diagnostics":
+            try:
+                from dreaming_engine import get_dream_status
+                from growth_loop import growth_status
+                from growth_jobs import status as training_job_status
+                from diagnostics import build_report
+                report = build_report(health_check(), get_dream_status(), growth_status(), training_job_status())
+                self._send(200, json.dumps({"ok": True, "report": report}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         elif self.path == "/api/settings/remote_llm":
             try:
                 from remote_llm import load_remote_llm_config, public_remote_llm_config, is_remote_llm_ready
@@ -14690,6 +18766,19 @@ class Handler(BaseHTTPRequestHandler):
                     "config": public_remote_llm_config(config),
                     "ready": is_remote_llm_ready(config),
                 }, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+        elif self.path == "/api/settings/tiny_llm":
+            try:
+                from tiny_llm import load_deep_reply_config
+                config = load_deep_reply_config()
+                self._send(200, json.dumps({"ok": True, **config}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+        elif self.path == "/api/chat/modes":
+            try:
+                from hybrid_chat import list_chat_modes
+                self._send(200, json.dumps({"ok": True, "modes": list_chat_modes()}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             except Exception as exc:
                 self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         elif self.path == "/api/identity":
@@ -14838,6 +18927,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self) -> None:
+        # LAN access control: non-loopback write requests must present the
+        # pairing token (Authorization: Bearer <token> or ?lan_token=<token>).
+        # Local requests (127.0.0.1) and local-only mode are always exempt.
+        if not self._lan_auth_ok():
+            self._send(403, json.dumps({"ok": False, "error": "LAN access token required", "reply": "局域网写入需要访问令牌。请在本地控制台查看 LAN 令牌。"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        if self.path == "/api/local_access":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+                if str(payload.get("action") or "") == "regenerate_token" and _is_loopback_client(self.client_address):
+                    new_token = lan_access_token(regenerate=True)
+                    self._send(200, json.dumps({"ok": True, "lan_token": new_token}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                    return
+                self._send(400, json.dumps({"ok": False, "error": "未知操作"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
         if self.path == "/api/privacy":
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
@@ -14896,7 +19006,7 @@ class Handler(BaseHTTPRequestHandler):
                 action = str(payload.get("action") or "status")
                 if action == "configure":
                     updates = {}
-                    for key in ("manifest_url", "auto_check", "auto_download", "auto_install", "check_interval_hours"):
+                    for key in ("auto_check", "auto_download", "auto_install", "check_interval_hours"):
                         if key in payload:
                             updates[key] = payload[key]
                     save_update_state(updates)
@@ -14912,6 +19022,53 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             except Exception as exc:
                 self._send(500, json.dumps({"ok": False, "error": str(exc), **update_public_state()}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        if self.path == "/api/backup":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+                action = str(payload.get("action") or "create")
+                if action == "create":
+                    result = create_backup()
+                elif action == "restore_path":
+                    archive_path = Path(str(payload.get("path") or ""))
+                    result = restore_backup(archive_path)
+                else:
+                    result = {"ok": False, "error": f"未知操作: {action}"}
+                self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        if self.path == "/api/backup/restore":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            ct = self.headers.get("Content-Type", "")
+            try:
+                parsed = parse_multipart(raw, ct)
+                if not parsed:
+                    self._send(400, json.dumps({"ok": False, "error": "没有找到备份文件。"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                    return
+                name, data = parsed
+                if len(data) > 500_000_000:
+                    self._send(400, json.dumps({"ok": False, "error": "备份文件过大（限制 500MB）。"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                    return
+                import tempfile as _tempfile
+                with _tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+                    tmp.write(data)
+                    tmp_path = Path(tmp.name)
+                try:
+                    result = restore_backup(tmp_path)
+                finally:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             return
 
         if self.path in {"/api/chat", "/api/upload", "/api/observe_screen", "/api/realtime_observe", "/api/realtime_event", "/api/feedback", "/api/correct", "/api/emotion_feedback", "/api/audit_training", "/api/moments", "/api/voiceprints", "/api/identity_confirmation", "/api/face/register", "/api/face/delete", "/api/face/rename"} and not load_privacy_consent().get("accepted"):
@@ -15079,6 +19236,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = json.loads(raw.decode("utf-8") or "{}")
                 result = handle_moments_post(payload)
+                if result.get("moments"):
+                    result["moments"] = _moments_with_image_urls(result["moments"])
+                if result.get("post"):
+                    result["post"]["image_url"] = _moment_image_url(result["post"].get("image", ""))
                 self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             except Exception as exc:
                 self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
@@ -15097,6 +19258,7 @@ class Handler(BaseHTTPRequestHandler):
                         "name": payload.get("name", "").strip(),
                         "relationship_type": payload.get("relationship_type", "friend").strip() or "friend",
                         "relationship_label": payload.get("relationship_label", "").strip(),
+                        "relationship_subtype": payload.get("relationship_subtype", "").strip(),
                         "allow_romance_evolution": bool(payload.get("allow_romance_evolution", True)),
                         "birthday": payload.get("birthday", "").strip(),
                         "persona": payload.get("persona", "").strip(),
@@ -15124,14 +19286,16 @@ class Handler(BaseHTTPRequestHandler):
                                 "error": assignment.get("error", "未使用大模型接口分配"),
                             }
 
-                    save_identity(identity)
-                    configure_relationship(
+                    growth = configure_relationship(
                         identity["relationship_type"],
                         custom_label=identity.get("relationship_label", ""),
+                        relationship_subtype=identity.get("relationship_subtype", ""),
                         romance_label=relationship_romance_label(identity.get("gender", "")),
                         romance_enabled=identity.get("allow_romance_evolution", True),
                         assignment=identity.get("relationship_assignment", {}),
                     )
+                    identity["relationship_subtype"] = growth.get("relationship_profile", {}).get("relationship_subtype", "")
+                    save_identity(identity)
                     self._send(200, json.dumps({"ok": True, "identity": identity}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
                 
                 elif action == "generate_id":
@@ -15275,7 +19439,148 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             return
 
+        if self.path == "/api/neural/train":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if payload.get("backend") != "directml":
+                    result = {"ok": False, "error": "此入口仅支持 DirectX 12 (DirectML) 训练。"}
+                else:
+                    result = train_motion_net_gpu_isolated(backend="directml")
+                self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        if self.path == "/api/settings/growth":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                from growth_loop import add_benchmark, remove_benchmark, rollback_active_model, update_experience, delete_experience, activate_model_version
+                from image_growth import record_feedback as record_image_feedback
+                from growth_jobs import start as start_growth_training, cancel as cancel_growth_training
+                action = str(payload.get("action") or "").strip()
+                if action == "add_benchmark":
+                    result = add_benchmark(str(payload.get("prompt") or ""), str(payload.get("keywords") or ""), rule=str(payload.get("rule") or "keywords"))
+                elif action == "update_benchmark":
+                    from growth_loop import update_benchmark
+                    result = update_benchmark(str(payload.get("id") or ""), str(payload.get("prompt") or ""), str(payload.get("keywords") or ""), rule=str(payload.get("rule") or "keywords"), manual_pass=payload.get("manual_pass"))
+                elif action == "remove_benchmark":
+                    result = {"ok": remove_benchmark(str(payload.get("id") or ""))}
+                    if not result["ok"]:
+                        result["error"] = "未找到该评测题。"
+                elif action == "rollback":
+                    result = rollback_active_model()
+                elif action == "activate_version":
+                    result = activate_model_version(str(payload.get("id") or ""))
+                elif action == "update_experience":
+                    result = update_experience(str(payload.get("id") or ""), reward=payload.get("reward"), verified=payload.get("verified"), response=payload.get("response"))
+                elif action == "delete_experience":
+                    result = {"ok": delete_experience(str(payload.get("id") or ""))}
+                elif action == "add_calibration":
+                    from growth_loop import record_experience
+                    result = record_experience(str(payload.get("prompt") or ""), str(payload.get("response") or ""), source="calibration:manual", evidence_type="human", reward=1.0, evidence="用户在设置中明确批准的真实样本标定")
+                elif action == "image_feedback":
+                    result = {"ok": record_image_feedback(str(payload.get("path") or ""), str(payload.get("feedback") or ""))}
+                elif action == "save_image_backend":
+                    from local_image_backend import save_config as save_image_backend_config, public_status as image_backend_status
+                    config = save_image_backend_config(payload)
+                    status = image_backend_status(check_service=True)
+                    result = {"ok": True, "config": config, "message": status.get("message", "本地图片后端已保存。")}
+                elif action == "start_training":
+                    result = start_growth_training(int(payload.get("epochs") or 3))
+                elif action == "cancel_training":
+                    result = cancel_growth_training()
+                else:
+                    result = {"ok": False, "error": "未知成长设置操作"}
+                self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        if self.path == "/api/settings/runtime":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                from dreaming_engine import handle_dream_command, load_dream_config, save_dream_config, start_dreaming_engine, stop_dreaming_engine
+                from routine_tracker import set_autostart_enabled
+                action = str(payload.get("action") or "").strip()
+                if action == "save":
+                    config = load_dream_config()
+                    def bounded(name: str, low: int, high: int, fallback: int) -> int:
+                        try:
+                            return max(low, min(high, int(payload.get(name, fallback))))
+                        except (TypeError, ValueError):
+                            return fallback
+                    config["enabled"] = bool(payload.get("dream_enabled"))
+                    config["system_idle_threshold_seconds"] = bounded("system_idle_threshold_seconds", 30, 3600, int(config.get("system_idle_threshold_seconds", 60)))
+                    config["chat_idle_threshold_seconds"] = bounded("chat_idle_threshold_seconds", 15, 3600, int(config.get("chat_idle_threshold_seconds", 30)))
+                    config["review_interval_hours"] = bounded("review_interval_hours", 1, 168, int(config.get("review_interval_hours", 4)))
+                    heavy_minutes = bounded("heavy_task_idle_minutes", 1, 240, max(1, int(config.get("heavy_task_system_idle_min", 300)) // 60))
+                    config["heavy_task_system_idle_min"] = heavy_minutes * 60
+                    config["heavy_task_chat_idle_min"] = heavy_minutes * 60
+                    quiet = payload.get("quiet_hours", config.get("quiet_hours", []))
+                    if isinstance(quiet, list):
+                        config["quiet_hours"] = sorted({int(hour) for hour in quiet if isinstance(hour, int) and 0 <= hour <= 23})
+                    save_dream_config(config)
+                    if config["enabled"]:
+                        start_dreaming_engine()
+                    else:
+                        stop_dreaming_engine()
+                    startup_message = set_autostart_enabled(bool(payload.get("autostart")))
+                    result = {"ok": True, "message": f"后台设置已保存。{startup_message}"}
+                elif action == "review_now":
+                    reply = handle_dream_command("/dream_now") or "整理命令未执行"
+                    result = {"ok": True, "message": reply}
+                elif action == "practice_now":
+                    reply = handle_dream_command("/dream_practice") or "练习命令未执行"
+                    result = {"ok": True, "message": reply}
+                else:
+                    result = {"ok": False, "error": "未知后台设置操作"}
+                self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        if self.path == "/api/settings/diagnostics":
+            try:
+                from dreaming_engine import get_dream_status
+                from growth_loop import growth_status
+                from growth_jobs import status as training_job_status
+                from diagnostics import build_report, export_report
+                report = build_report(health_check(), get_dream_status(), growth_status(), training_job_status())
+                path = export_report(report)
+                self._send(200, json.dumps({"ok": True, "path": path}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
         # -- settings: save audit config --
+        if self.path == "/api/settings/models":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                scope = str(payload.get("scope") or "").strip()
+                if scope == "audit":
+                    from conversation_audit import load_audit_config
+                    configured = load_audit_config()
+                elif scope == "remote_llm":
+                    from remote_llm import load_remote_llm_config
+                    configured = load_remote_llm_config()
+                else:
+                    self._send(400, json.dumps({"ok": False, "error": "未知模型配置范围"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                    return
+                api_base = str(payload.get("api_base") or configured.get("api_base") or "").strip()
+                supplied_key = str(payload.get("api_key") or "").strip()
+                use_saved_key = bool(payload.get("use_saved_key"))
+                api_key = supplied_key if supplied_key and supplied_key != "***" else (str(configured.get("api_key") or "") if use_saved_key else "")
+                from remote_llm import list_available_models
+                result = list_available_models(api_base, api_key)
+                self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "models": [], "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
         if self.path == "/api/settings/audit":
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
@@ -15286,7 +19591,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Update only provided fields
                 for key in ("enabled", "api_provider", "api_base", "api_key", "model",
                             "batch_size", "audit_interval", "max_context_turns", "language",
-                            "auto_suggest_corrections", "correction_threshold", "local_fallback"):
+                            "auto_suggest_corrections", "correction_threshold", "local_fallback", "use_cloud_audit"):
                     if key in payload:
                         config[key] = payload[key]
                 save_audit_config(config)
@@ -15303,7 +19608,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(raw.decode("utf-8") or "{}")
                 from remote_llm import load_remote_llm_config, test_remote_llm_connection
                 config = load_remote_llm_config()
-                for key in ("enabled", "enabled_for_hybrid", "api_base", "api_key", "model", "temperature", "max_tokens", "timeout", "user_prompt"):
+                for key in ("enabled", "enabled_for_hybrid", "reasoning_enabled", "reasoning_effort", "api_base", "api_key", "model", "temperature", "max_tokens", "timeout", "user_prompt"):
                     if key in payload:
                         if key == "api_key" and str(payload.get("api_key") or "").strip() in {"", "***"}:
                             continue
@@ -15322,7 +19627,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(raw.decode("utf-8") or "{}")
                 from remote_llm import save_remote_llm_config, public_remote_llm_config, is_remote_llm_ready
                 updates = {}
-                for key in ("enabled", "enabled_for_hybrid", "api_base", "api_key", "model", "temperature", "max_tokens", "timeout", "user_prompt"):
+                for key in ("enabled", "enabled_for_hybrid", "reasoning_enabled", "reasoning_effort", "api_base", "api_key", "model", "temperature", "max_tokens", "timeout", "user_prompt"):
                     if key in payload:
                         if key == "api_key" and str(payload.get("api_key") or "").strip() in {"", "***"}:
                             continue
@@ -15333,6 +19638,33 @@ class Handler(BaseHTTPRequestHandler):
                     "config": public_remote_llm_config(config),
                     "ready": is_remote_llm_ready(config),
                 }, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        if self.path == "/api/settings/tiny_llm":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                from tiny_llm import save_deep_reply_config
+                config = save_deep_reply_config({"enabled": payload.get("enabled", False)})
+                self._send(200, json.dumps({"ok": True, **config}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        if self.path == "/api/chat/mode":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                mode = str(payload.get("mode") or "").strip()
+                from hybrid_chat import CHAT_MODES, set_chat_mode
+                result = set_chat_mode(mode)
+                if result.get("ok"):
+                    result["name"] = CHAT_MODES[mode]["name"]
+                    self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                else:
+                    self._send(400, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             except Exception as exc:
                 self._send(500, json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             return
@@ -15613,12 +19945,38 @@ def _start_deferred_services() -> None:
     except Exception as exc:
         print(f"Conversation audit 初始化失败: {exc}")
 
+    try:
+        from dreaming_engine import start_dreaming_engine
+        start_dreaming_engine()
+        print("Dreaming engine started (background dreaming/consolidation)")
+    except Exception as exc:
+        print(f"Dreaming engine 初始化失败: {exc}")
+
+    try:
+        from knowledge_distillation import start_distillation_engine
+        start_distillation_engine()
+        print("Knowledge distillation engine started (teacher-student learning)")
+    except Exception as exc:
+        print(f"Knowledge distillation engine 初始化失败: {exc}")
+
+    try:
+        from proactive_engagement import start_proactive_engine
+        start_proactive_engine()
+        print("Proactive engagement engine started")
+    except Exception as exc:
+        print(f"Proactive engagement engine 初始化失败: {exc}")
+
 
 def main() -> None:
     ensure_data()
     install_shutdown_handlers("web")
     record_app_start("web")
     atexit.register(lambda: record_app_stop("web"))
+
+    if ALLOW_LAN or HOST in {"0.0.0.0", "::"}:
+        token = lan_access_token()
+        print(f"LAN mode enabled. Pairing token: {token}")
+        print("Share this token with trusted LAN devices; non-local write requests require it.")
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Companion AI running at http://{HOST}:{PORT}")

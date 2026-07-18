@@ -358,6 +358,11 @@
       if (embedMode) {
         controls.style.display = "none";
         document.body.classList.add("pet-mode");
+        document.body.classList.add("shell-mode");
+        var hoverDialog = document.getElementById("hover-dialog");
+        if (hoverDialog) hoverDialog.style.display = "none";
+        var dragHandle = document.getElementById("drag-handle");
+        if (dragHandle) dragHandle.style.display = "none";
         // 只有真正的 pywebview 桌宠窗口使用 #ff00ff 色键透明。
         // 官网/控制台里的 embed 预览保持透明，避免浏览器里出现紫色背景。
         if (chromaKeyMode) {
@@ -651,7 +656,12 @@
   const params = new URLSearchParams(location.search);
   const embedMode = params.get("embed") === "1" || params.get("pet") === "1";
   const triggerMotion = params.get("motion");
-  if (embedMode) document.getElementById("controls").style.display = "none";
+  if (embedMode) {
+    document.getElementById("controls").style.display = "none";
+    document.body.classList.add("shell-mode");
+    const hoverDialog = document.getElementById("hover-dialog");
+    if (hoverDialog) hoverDialog.style.display = "none";
+  }
 
   // -- Three.js scene setup --
   const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
@@ -691,18 +701,33 @@
     scene.add(gridHelper);
   }
 
-  // OrbitControls (only in non-pet mode)
+  // OrbitControls: full orbit outside embed; pan/drag only in embed/web preview.
   let controls = null;
-  if (!embedMode) {
-    controls = new OrbitControls(camera, canvas);
-    controls.target.set(0, 1, 0);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.1;
-    controls.update();
+  controls = new OrbitControls(camera, canvas);
+  controls.target.set(0, 1, 0);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.1;
+  if (embedMode) {
+    controls.enableRotate = false;
+    controls.enableZoom = true;
+    controls.enablePan = true;
+    controls.screenSpacePanning = true;
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.PAN,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.ROTATE,
+    };
+    controls.touches = {
+      ONE: THREE.TOUCH.PAN,
+      TWO: THREE.TOUCH.DOLLY_PAN,
+    };
   }
+  controls.update();
 
   // -- State --
   let currentModel = null;
+  const embedPanAnchor = new THREE.Vector3();
+  const embedPanLimit = new THREE.Vector2();
   let currentMixer = null;
   let mmdHelper = null;
   let currentVRM = null;
@@ -719,6 +744,47 @@
   let expressionPulseUntil = 0;
   let motionResetTimer = null;
   window.__3dLoaded = false;
+
+  function fitEmbeddedModel(object) {
+    if (!embedMode || !controls || !object) return;
+    const box = new THREE.Box3().setFromObject(object);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const verticalFov = THREE.MathUtils.degToRad(camera.fov);
+    const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
+    const distance = Math.max(
+      size.y / (2 * Math.tan(verticalFov / 2)),
+      size.x / (2 * Math.tan(horizontalFov / 2))
+    ) * 1.16;
+    const direction = camera.position.clone().sub(controls.target).normalize();
+
+    camera.position.copy(center).addScaledVector(direction, Math.max(distance, 0.1));
+    controls.target.copy(center);
+    controls.enableZoom = false;
+    embedPanAnchor.copy(center);
+
+    const visibleHalfWidth = distance * Math.tan(horizontalFov / 2);
+    const visibleHalfHeight = distance * Math.tan(verticalFov / 2);
+    embedPanLimit.set(
+      Math.max(0, visibleHalfWidth - size.x / 2) * 0.92,
+      Math.max(0, visibleHalfHeight - size.y / 2) * 0.92
+    );
+    controls.update();
+  }
+
+  if (embedMode) {
+    controls.addEventListener("change", () => {
+      const target = controls.target;
+      const clampedX = THREE.MathUtils.clamp(target.x, embedPanAnchor.x - embedPanLimit.x, embedPanAnchor.x + embedPanLimit.x);
+      const clampedY = THREE.MathUtils.clamp(target.y, embedPanAnchor.y - embedPanLimit.y, embedPanAnchor.y + embedPanLimit.y);
+      const clampedZ = embedPanAnchor.z;
+      const correction = new THREE.Vector3(clampedX, clampedY, clampedZ).sub(target);
+      if (correction.lengthSq() > 0) {
+        controls.target.add(correction);
+        camera.position.add(correction);
+      }
+    });
+  }
 
   const MOTION_LABELS = {
     idle: "待机",
@@ -852,7 +918,7 @@
     const lookX = THREE.MathUtils.clamp(lookTarget.x, -1, 1);
     const lookY = THREE.MathUtils.clamp(lookTarget.y, -1, 1);
     const headYaw = lookX * 0.18;
-    const headPitch = -lookY * 0.11;
+    const headPitch = lookY * 0.11;
     const idlePitch = Math.sin(time * 1.6) * 0.018;
     const happyBounce = ["happy", "celebrate", "spark"].includes(motion) ? Math.sin(time * 7.0) * 0.06 : 0;
     const thinkingTilt = motion === "thinking" ? 0.13 + Math.sin(time * 1.8) * 0.045 : 0;
@@ -996,6 +1062,7 @@
       controls.target.copy(newCenter);
       controls.update();
     }
+    fitEmbeddedModel(object);
   }
 
   function createPlaceholderModel() {
@@ -1249,17 +1316,28 @@
 
   // -- Mouse tracking for VRM eye movement --
   const mouse = new THREE.Vector2();
-  canvas.addEventListener("mousemove", (e) => {
-    mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
-    mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
-    lookTarget.lerp(mouse, 0.35);
-
-    // VRM look-at
+  function applyLookTarget(normalizedX, normalizedY, smoothing = 0.35) {
+    mouse.set(
+      THREE.MathUtils.clamp(normalizedX, -1, 1),
+      THREE.MathUtils.clamp(normalizedY, -1, 1)
+    );
+    if (smoothing >= 1) {
+      lookTarget.copy(mouse);
+    } else {
+      lookTarget.lerp(mouse, smoothing);
+    }
     if (currentVRM && currentVRM.lookAt) {
       const lookAt = currentVRM.lookAt;
-      const target = new THREE.Vector3(mouse.x * 3, mouse.y * 2 + 1.2, 2);
+      const target = new THREE.Vector3(mouse.x * 3, -mouse.y * 2 + 1.2, 2);
       lookAt.setTargetPosition(target);
     }
+  }
+  canvas.addEventListener("mousemove", (e) => {
+    applyLookTarget(
+      (e.clientX / Math.max(1, window.innerWidth)) * 2 - 1,
+      -(e.clientY / Math.max(1, window.innerHeight)) * 2 + 1,
+      0.35
+    );
   });
 
   // -- Animation loop --
@@ -1286,6 +1364,7 @@
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    fitEmbeddedModel(currentModel);
   });
 
   // -- UI events --
@@ -1304,7 +1383,7 @@
       if (cursor && windowBounds) {
         const x = (cursor.x - windowBounds.x) / Math.max(1, windowBounds.width);
         const y = (cursor.y - windowBounds.y) / Math.max(1, windowBounds.height);
-        lookTarget.set(THREE.MathUtils.clamp(x * 2 - 1, -1, 1), THREE.MathUtils.clamp(-(y * 2 - 1), -1, 1));
+        applyLookTarget(x * 2 - 1, -(y * 2 - 1), 0.45);
       }
       return;
     }
@@ -1328,6 +1407,7 @@
   let dialogVisible = false;
 
   function showDialog() {
+    if (embedMode) return;
     if (dialogVisible) return;
     dialogVisible = true;
     dialog.classList.add("visible");

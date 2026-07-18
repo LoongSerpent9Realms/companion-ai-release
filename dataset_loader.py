@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from _paths import module_root, data_dir, resource_dir, runtime_python_exe
+from _paths import module_root, data_dir, resource_dir, runtime_python_exe, runtime_subprocess_env
 from dependency_utils import ensure_dataset_dependencies
 
 ROOT = module_root(__file__)
@@ -87,6 +87,7 @@ def _load_with_runtime_worker(config: dict, reason: BaseException | None = None)
         text=True,
         timeout=1800,
         creationflags=CREATE_NO_WINDOW,
+        env=runtime_subprocess_env(py),
     )
     output = (proc.stdout or "").strip()
     try:

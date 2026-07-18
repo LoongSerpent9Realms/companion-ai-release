@@ -93,8 +93,28 @@ def _already_recorded(training: dict, audit_id: str, source: str) -> bool:
     return False
 
 
+def _sync_positive_example(prompt: str, response: str, source: str) -> None:
+    """Make a just-accepted audit correction available to live retrieval."""
+    if not prompt or not response:
+        return
+    try:
+        from hybrid_chat import get_hybrid_chatbot
+
+        chatbot = get_hybrid_chatbot()
+        if not getattr(chatbot, "initialized", False):
+            return
+        embedding_index = getattr(chatbot, "embedding_index", None)
+        if embedding_index is not None and getattr(embedding_index, "loaded", False):
+            embedding_index.add_example(prompt, response, source=source)
+        retrieval = getattr(chatbot, "retrieval", None)
+        if retrieval is not None and getattr(retrieval, "loaded", False):
+            retrieval.index.add_example(prompt, response, source=source)
+    except Exception:
+        pass
+
+
 def handled_audit_ids(training: dict | None = None) -> set[str]:
-    """Return audit IDs already handled by a human decision."""
+    """Return audit IDs already resolved by a human or auto-accepted rewrite."""
     data = training if training is not None else _load_training()
     handled: set[str] = set()
     for bucket in ("feedback", "examples"):
@@ -102,7 +122,11 @@ def handled_audit_ids(training: dict | None = None) -> set[str]:
             audit_id = str(item.get("audit_id") or "").strip()
             source = str(item.get("source") or "")
             decision = str(item.get("decision") or "")
-            if audit_id and (source.startswith("audit_human_") or decision in {"approve", "reject", "correct", "skip"}):
+            if audit_id and (
+                source.startswith("audit_human_")
+                or source == "audit_auto_correct"
+                or decision in {"approve", "reject", "correct", "skip", "auto_correct"}
+            ):
                 handled.add(audit_id)
     return handled
 
@@ -123,7 +147,9 @@ def record_audit_training(
       - skip: human intentionally leaves it as audit feedback only
     """
     audit_id = audit_result_id(result)
-    source = f"audit_human_{decision}" if decision != "auto" else "audit"
+    source = f"audit_human_{decision}" if decision not in {"auto", "auto_correct"} else (
+        "audit_auto_correct" if decision == "auto_correct" else "audit"
+    )
     training = _load_training()
     if _already_recorded(training, audit_id, source):
         return training
@@ -132,7 +158,7 @@ def record_audit_training(
     raw_reply = str(result.get("ai_reply") or "").strip()
     reply = training_response_text(corrected_response or raw_reply)
     rating = _audit_rating(result)
-    if decision in {"approve", "correct"}:
+    if decision in {"approve", "correct", "auto_correct"}:
         rating = 1
     elif decision == "reject":
         rating = -1
@@ -165,7 +191,8 @@ def record_audit_training(
     training.setdefault("feedback", []).append(row)
 
     should_add_example = bool(prompt and reply) and (
-        decision in {"approve", "correct"} or (decision == "auto" and rating > 0 and not result.get("needs_user_action"))
+        decision in {"approve", "correct", "auto_correct"}
+        or (decision == "auto" and rating > 0 and not result.get("needs_user_action"))
     )
     if should_add_example:
         example = dict(row)
@@ -174,6 +201,14 @@ def record_audit_training(
         training.setdefault("examples", []).append(example)
 
     _save_training(training)
+    if should_add_example:
+        _sync_positive_example(prompt, reply, source)
+        if decision in {"approve", "correct"}:
+            try:
+                from growth_loop import record_experience
+                record_experience(prompt, reply, source=source, evidence_type="human", reward=1, evidence=note or "用户确认审计结果")
+            except Exception:
+                pass
     return training
 
 

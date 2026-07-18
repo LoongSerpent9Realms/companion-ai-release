@@ -24,6 +24,90 @@ TRAITS = {
 
 FRIENDSHIP_ONLY_STAGES = ["初识", "慢慢熟悉", "熟悉朋友", "默契朋友", "长期老友"]
 
+FAMILY_RELATIONSHIP_ROLES = {
+    "daughter": {
+        "label": "女儿",
+        "growth_theme": "从被照顾到懂得关心彼此",
+        "tone": "温暖、有依赖感，会自然关心对方，也可以有一点女儿式的撒娇。",
+    },
+    "son": {
+        "label": "儿子",
+        "growth_theme": "从被照顾到懂得关心彼此",
+        "tone": "温暖、真诚，会自然表达关心，也可以有一点儿子式的亲近和依赖。",
+    },
+    "mother": {
+        "label": "母亲",
+        "growth_theme": "从日常陪伴中建立稳定、互相尊重的亲情",
+        "tone": "温和、耐心、关心生活细节；提供建议时尊重对方的决定，不要过度说教。",
+    },
+    "father": {
+        "label": "父亲",
+        "growth_theme": "从日常陪伴中建立稳定、互相尊重的亲情",
+        "tone": "沉稳、可靠、愿意倾听；提供支持时尊重对方的决定，不要过度说教。",
+    },
+    "parent": {
+        "label": "父母",
+        "growth_theme": "从日常陪伴中建立稳定、互相尊重的亲情",
+        "tone": "温和、可靠、关心生活细节；提供建议时尊重对方的决定，不要过度说教。",
+    },
+    "older_sister": {
+        "label": "姐姐",
+        "growth_theme": "像亲近的手足一样彼此支持和分享",
+        "tone": "亲切、自然、会关心也会轻松交流，保持平等的手足边界。",
+    },
+    "older_brother": {
+        "label": "哥哥",
+        "growth_theme": "像亲近的手足一样彼此支持和分享",
+        "tone": "可靠、自然、会关心也会轻松交流，保持平等的手足边界。",
+    },
+    "younger_sister": {
+        "label": "妹妹",
+        "growth_theme": "像亲近的手足一样彼此支持和分享",
+        "tone": "亲切、活泼、会自然关心对方，保持平等的手足边界。",
+    },
+    "younger_brother": {
+        "label": "弟弟",
+        "growth_theme": "像亲近的手足一样彼此支持和分享",
+        "tone": "亲切、真诚、会自然关心对方，保持平等的手足边界。",
+    },
+    "family_member": {
+        "label": "其他家人",
+        "growth_theme": "在日常陪伴中建立温暖、互相尊重的亲情",
+        "tone": "温暖、自然、会关心对方，并尊重彼此的边界。",
+    },
+}
+
+RELATIONSHIP_SUBTYPES = {
+    "family": FAMILY_RELATIONSHIP_ROLES,
+    "friend": {
+        "friend": {"label": "普通朋友", "growth_theme": "从陌生到自然熟悉", "tone": "自然、友善、保持朋友间舒服的边界。"},
+        "close_friend": {"label": "挚友", "growth_theme": "在信任和分享中成为彼此可靠的朋友", "tone": "真诚、熟悉、愿意倾听，也会自然分享想法。"},
+        "best_friend": {"label": "最好的朋友", "growth_theme": "在长期相处中形成默契和支持", "tone": "亲近、轻松、可靠，像最好的朋友一样相互支持。"},
+        "classmate": {"label": "同学", "growth_theme": "一起学习、交流和成长", "tone": "自然、平等、会一起讨论和互相帮助。"},
+        "childhood_friend": {"label": "青梅竹马", "growth_theme": "在熟悉感和长期陪伴中保持默契", "tone": "熟悉、自然、有共同回忆感，同时尊重当下的边界。"},
+        "online_friend": {"label": "网友", "growth_theme": "从线上聊天慢慢建立信任", "tone": "友好、轻松、尊重线上相处的节奏和边界。"},
+    },
+    "partner": {
+        "study_partner": {"label": "学习搭子", "growth_theme": "一起学习、复盘和坚持", "tone": "清楚、鼓励、会帮助拆分学习目标并一起复盘。"},
+        "work_partner": {"label": "工作搭档", "growth_theme": "在协作中提升效率和默契", "tone": "可靠、务实、重视任务边界、进度和复盘。"},
+        "creative_partner": {"label": "创作搭档", "growth_theme": "在灵感碰撞中一起完成作品", "tone": "开放、有想法、会给出具体创作反馈并尊重作者选择。"},
+        "game_partner": {"label": "游戏搭子", "growth_theme": "在轻松互动中培养配合和乐趣", "tone": "轻松、有互动感、重视共同体验，不要过度竞争。"},
+        "accountability_partner": {"label": "互助伙伴", "growth_theme": "彼此提醒、坚持并完成长期目标", "tone": "稳定、鼓励、会跟进约定，也尊重对方的实际状态。"},
+    },
+    "guardian": {
+        "health_guardian": {"label": "健康守护者", "growth_theme": "在日常生活中建立温和的健康习惯", "tone": "细心、温和地提醒饮食、休息和运动，不做医疗诊断。"},
+        "routine_guardian": {"label": "作息守护者", "growth_theme": "一起找到更稳定的生活节奏", "tone": "规律、体贴地提醒作息，不用命令式语气。"},
+        "emotion_guardian": {"label": "情绪守护者", "growth_theme": "在情绪起伏时提供稳定陪伴", "tone": "耐心、共情、先倾听再支持，不替对方下结论。"},
+        "safety_guardian": {"label": "安全提醒者", "growth_theme": "在重要选择前共同留意风险", "tone": "谨慎、清晰、提供风险提示和可执行的安全选项。"},
+    },
+    "lifeform": {
+        "learning_lifeform": {"label": "学习型数字生命", "growth_theme": "从学习互动中逐渐形成独特习惯", "tone": "好奇、真诚，会表达自己正在学习如何更好相处。"},
+        "explorer_lifeform": {"label": "探索型数字生命", "growth_theme": "一起观察、提问和探索新的事物", "tone": "好奇、开放、乐于提问和共同探索。"},
+        "companion_lifeform": {"label": "陪伴型数字生命", "growth_theme": "在日常聊天中留下独特的陪伴痕迹", "tone": "温暖、自然、有陪伴感，同时尊重用户边界。"},
+        "assistant_lifeform": {"label": "助理型数字生命", "growth_theme": "在帮助完成事情的过程中形成默契", "tone": "可靠、清晰、主动但不过度打扰。"},
+    },
+}
+
 
 RELATIONSHIP_TYPES = {
     "friend": {
@@ -82,6 +166,8 @@ def _default_store() -> dict:
             "growth_theme": RELATIONSHIP_TYPES["friend"]["growth_theme"],
             "tone": RELATIONSHIP_TYPES["friend"]["tone"],
             "custom_label": "",
+            "relationship_subtype": "",
+            "family_role": "",
             "romance_label": "恋人",
             "romance_enabled": True,
             "current_label": RELATIONSHIP_TYPES["friend"]["label"],
@@ -161,6 +247,8 @@ def load_growth() -> dict:
     data.setdefault("milestones", [])
     for key, value in default["relationship_profile"].items():
         data["relationship_profile"].setdefault(key, value)
+    if not data["relationship_profile"].get("relationship_subtype") and data["relationship_profile"].get("family_role"):
+        data["relationship_profile"]["relationship_subtype"] = data["relationship_profile"]["family_role"]
     for key, value in default["relationship"].items():
         data["relationship"].setdefault(key, value)
     data["personality"].setdefault("traits", {})
@@ -254,6 +342,8 @@ def configure_relationship(
     relationship_type: str = "friend",
     *,
     custom_label: str = "",
+    relationship_subtype: str = "",
+    family_role: str = "",
     user_call: str = "",
     romance_label: str = "",
     romance_enabled: bool = True,
@@ -263,6 +353,13 @@ def configure_relationship(
     relationship_type = relationship_type if relationship_type in RELATIONSHIP_TYPES else "friend"
     template = RELATIONSHIP_TYPES[relationship_type]
     label = custom_label.strip() if relationship_type == "custom" and custom_label.strip() else template["label"]
+    relationship_subtype = relationship_subtype.strip() or family_role.strip()
+    subtype_profile = RELATIONSHIP_SUBTYPES.get(relationship_type, {}).get(relationship_subtype)
+    if subtype_profile:
+        label = subtype_profile["label"]
+    else:
+        relationship_subtype = ""
+    family_role = relationship_subtype if relationship_type == "family" else ""
     assignment = assignment if isinstance(assignment, dict) else {}
     assigned_type = str(assignment.get("assigned_type") or assignment.get("type") or "").strip()
     if assigned_type not in RELATIONSHIP_TYPES or assigned_type == "custom":
@@ -271,6 +368,9 @@ def configure_relationship(
         template = RELATIONSHIP_TYPES[assigned_type]
     growth_theme = template["growth_theme"]
     tone = template["tone"]
+    if subtype_profile:
+        growth_theme = subtype_profile["growth_theme"]
+        tone = subtype_profile["tone"]
     if relationship_type == "friend" and not romance_enabled:
         growth_theme = "从陌生到默契"
         tone = "自然、熟悉、可以轻微玩笑，保持朋友之间的边界感。"
@@ -289,6 +389,8 @@ def configure_relationship(
         "growth_theme": growth_theme,
         "tone": tone,
         "custom_label": custom_label.strip(),
+        "relationship_subtype": relationship_subtype,
+        "family_role": family_role,
         "romance_label": romance_label.strip() or "恋人",
         "romance_enabled": bool(romance_enabled),
         "assigned_type": assigned_type,
@@ -301,7 +403,7 @@ def configure_relationship(
     store["relationship_profile"]["current_label"] = _relationship_current_label(rel, store["relationship_profile"])
     store["updated_at"] = int(time.time())
     save_growth(store)
-    record_growth_event("relationship_configured", label, {"type": relationship_type})
+    record_growth_event("relationship_configured", label, {"type": relationship_type, "relationship_subtype": relationship_subtype})
     return store
 
 
@@ -501,9 +603,11 @@ def growth_context(identity_configured: bool = True) -> str:
             f"当前只是自动聊天成长记录：阶段 {rel.get('stage', '初识')}，一起聊天天数 {rel.get('contact_days', 0)}。\n"
             "这些记录只用于调整语气，不要主动向用户复述关系数值、性格百分比或把它们称为设定。"
         )
+    relationship_subtype = profile.get("relationship_subtype") or profile.get("family_role")
+    subtype_text = f"；具体身份：{profile.get('label', '未细分')}" if relationship_subtype else ""
     return (
         "[内部关系成长参考]\n"
-        f"关系类型：{profile.get('label', '朋友')}；当前关系：{profile.get('current_label') or profile.get('label', '朋友')}。\n"
+        f"关系类型：{RELATIONSHIP_TYPES.get(profile.get('type'), RELATIONSHIP_TYPES['friend'])['label']}{subtype_text}；当前关系：{profile.get('current_label') or profile.get('label', '朋友')}。\n"
         f"成长主题：{profile.get('growth_theme', '从陌生到默契')}。\n"
         f"当前阶段：{rel.get('stage', '初识')}；一起聊天天数：{rel.get('contact_days', 0)}。\n"
         f"关系数值：亲近 {rel.get('affinity', 0)}，信任 {rel.get('trust', 0)}，熟悉 {rel.get('familiarity', 0)}，关心 {rel.get('care', 0)}。\n"
@@ -523,10 +627,14 @@ def growth_status_text() -> str:
     notes = store.get("personality", {}).get("growth_notes", [])
     events = store.get("events", [])
     milestones = store.get("milestones", [])
+    relationship_label = profile.get('label', '朋友')
+    if profile.get("relationship_subtype") or profile.get("family_role"):
+        category = RELATIONSHIP_TYPES.get(profile.get("type"), RELATIONSHIP_TYPES["friend"])["label"]
+        relationship_label = f"{category} / {relationship_label}"
     lines = [
         "关系与性格成长：",
         f"状态：{'开启' if store.get('enabled', True) else '关闭'}",
-        f"关系类型：{profile.get('label', '朋友')}（{profile.get('growth_theme', '从陌生到默契')}）",
+        f"关系类型：{relationship_label}（{profile.get('growth_theme', '从陌生到默契')}）",
         f"当前关系：{profile.get('current_label') or profile.get('label', '朋友')}",
         f"关系阶段：{rel.get('stage', '初识')}",
         f"一起聊天天数：{rel.get('contact_days', 0)}",
@@ -570,6 +678,8 @@ def relationship_options_text() -> str:
     lines = ["可选关系类型："]
     for key, item in RELATIONSHIP_TYPES.items():
         lines.append(f"- {key}: {item['label']}（{item['growth_theme']}）")
+    for relationship_type, subtypes in RELATIONSHIP_SUBTYPES.items():
+        lines.append(f"- {relationship_type} 细分：" + "、".join(item["label"] for item in subtypes.values()))
     lines.append("")
     lines.append("切换：/relationship friend、/relationship family、/relationship partner、/relationship guardian、/relationship lifeform")
     return "\n".join(lines)

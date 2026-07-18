@@ -1,55 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from pathlib import Path
-
-
-ROOT = Path(SPECPATH)
-
-
-def optional_data(source, target):
-    path = ROOT / source
-    return (str(path), target) if path.exists() else None
-
-
-datas = [
-    optional_data("data", "data"),
-    optional_data("plugins", "plugins"),
-    optional_data("static", "static"),
-    optional_data("live2d_viewer.html", "."),
-    optional_data("viewer_3d.html", "."),
-    optional_data("official_site.html", "."),
-    optional_data("version.txt", "."),
-    optional_data("dataset_runtime_worker.py", "."),
-    optional_data("face_manager.py", "."),
-    optional_data("sensitive_json.py", "."),
-    optional_data("secure_json.py", "."),
-    optional_data("electron_pet", "electron_pet"),
-]
-datas = [item for item in datas if item is not None]
-
 
 a = Analysis(
-    [str(ROOT / "companion_launcher.py")],
-    pathex=[str(ROOT)],
+    ['C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\companion_launcher.py'],
+    pathex=[],
     binaries=[],
-    datas=datas,
-    hiddenimports=[
-        "hybrid_chat", "retrieval_chat", "tiny_llm", "embedding_retrieval",
-        "emotion_diary", "dataset_loader", "plugin_manager", "rapidocr_runner",
-        "face_manager", "neural_companion", "llm_inference", "llm_trainer",
-        "operation_learning", "procedural_rules", "conversation_audit",
-        "audit_training", "train_llm", "_paths", "app", "desktop_pet",
-        "webview", "pystray", "PIL", "certifi",
-    ],
+    datas=[('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\data', 'data'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\plugins', 'plugins'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\static', 'static'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\live2d_viewer.html', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\viewer_3d.html', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\official_site.html', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\version.txt', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\ai_icon.ico', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\pet_icon.ico', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\dataset_runtime_worker.py', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\tiny_llm_runtime_worker.py', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\tiny_llm.py', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\sparse_attention.py', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\_paths.py', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\face_manager.py', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\sensitive_json.py', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\secure_json.py', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\code_drills.json', '.'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\electron_pet', 'electron_pet'), ('C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\node_modules\\electron\\dist', 'node_modules/electron/dist'), ('C:\\Users\\24951\\AppData\\Roaming\\Python\\Python314\\site-packages\\face_recognition_models\\models', 'face_recognition_models/models')],
+    hiddenimports=['hybrid_chat', 'retrieval_chat', 'tiny_llm', 'embedding_retrieval', 'emotion_diary', 'dataset_loader', 'plugin_manager', 'rapidocr_runner', 'face_manager', 'neural_companion', 'llm_inference', 'llm_trainer', 'operation_learning', 'procedural_rules', 'conversation_audit', 'audit_training', 'train_llm', 'proactive_engagement', 'dreaming_engine', 'knowledge_distillation', 'memory_layer', 'user_profile', 'remote_llm', 'web_learner', 'code_lab', 'algorithm_curriculum', 'toolchain_manager', 'routine_tracker', 'companion_growth', 'dialogue_skills', 'dependency_utils', '_paths', 'app', 'desktop_pet', 'webview', 'pystray', 'PIL', 'certifi', 'image_generator'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        "torch", "torchvision", "torchaudio", "torch_directml", "triton",
-        "pytorch_triton", "cv2", "edge_tts", "datasets", "modelscope",
-        "modelscope_hub", "huggingface_hub", "pandas", "pyarrow", "fsspec",
-        "dill", "multiprocess", "xxhash", "addict",
-    ],
+    excludes=['torch', 'torchvision', 'torchaudio', 'torch_directml', 'triton', 'pytorch_triton', 'cv2', 'edge_tts', 'datasets', 'modelscope', 'modelscope_hub', 'huggingface_hub', 'pandas', 'pyarrow', 'fsspec', 'dill', 'multiprocess', 'xxhash', 'addict'],
     noarchive=False,
     optimize=0,
 )
@@ -60,7 +21,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="CompanionAI",
+    name='CompanionAI',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -71,7 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=[str(ROOT / "pet_icon.ico")],
+    icon=['C:\\Users\\24951\\Documents\\Codex\\2026-06-30\\z\\outputs\\companion_ai\\pet_icon.ico'],
 )
 coll = COLLECT(
     exe,
@@ -80,5 +41,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="CompanionAI",
+    name='CompanionAI',
 )

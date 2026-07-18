@@ -169,6 +169,14 @@ def record_action_outcome(skill_id: str, ok: bool, note: str = "") -> bool:
                 "summary": "操作成功" if ok else "操作失败，需要修正",
             })
             save_action_store(store)
+            if ok:
+                try:
+                    from growth_loop import record_experience
+                    prompt = f"执行操作技能：{item.get('title', '')}"
+                    response = "；".join(str(step) for step in item.get("steps", []))
+                    record_experience(prompt, response, source="action_outcome", evidence_type="user_approved", reward=1, evidence=note or "用户确认操作计划成功")
+                except Exception:
+                    pass
             return True
     return False
 

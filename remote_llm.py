@@ -37,6 +37,8 @@ DEFAULT_REMOTE_LLM_CONFIG = {
     "temperature": 0.7,
     "max_tokens": 1024,
     "timeout": 45,
+    "reasoning_enabled": False,
+    "reasoning_effort": "medium",
     "system_prompt": REMOTE_LLM_SYSTEM_PROMPT,
     "user_prompt": "",
 }
@@ -94,6 +96,9 @@ def _coerce_config(data: dict | None = None) -> dict:
     except Exception:
         raw["timeout"] = 45
     raw["user_prompt"] = str(raw.get("user_prompt") or "").strip()
+    raw["reasoning_enabled"] = bool(raw.get("reasoning_enabled"))
+    effort = str(raw.get("reasoning_effort") or "medium").lower().strip()
+    raw["reasoning_effort"] = effort if effort in {"low", "medium", "high"} else "medium"
     raw["system_prompt"] = str(raw.get("system_prompt") or DEFAULT_REMOTE_LLM_CONFIG["system_prompt"]).strip()
     if (
         "现实上下文、用户画像、记忆" in raw["system_prompt"]
@@ -153,6 +158,87 @@ def is_remote_llm_ready(config: dict | None = None) -> bool:
     return bool(data.get("enabled") and data.get("api_key") and data.get("api_base") and data.get("model"))
 
 
+def list_available_models(api_base: str, api_key: str, timeout: int = 15) -> dict:
+    """List models from an OpenAI-compatible API without persisting the key."""
+    base = str(api_base or "").strip().rstrip("/")
+    key = str(api_key or "").strip()
+    if not base or not key:
+        return {"ok": False, "models": [], "error": "缺少 API Base 或 API Key"}
+    if not re.match(r"^https?://", base, re.IGNORECASE):
+        return {"ok": False, "models": [], "error": "API Base 必须以 http:// 或 https:// 开头"}
+
+    if base.endswith("/chat/completions"):
+        base = base.removesuffix("/chat/completions")
+    url = base if base.endswith("/models") else f"{base}/models"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            # Some API gateways reject urllib's default user agent before the
+            # request reaches their OpenAI-compatible endpoint.
+            "User-Agent": "CompanionAI/1.0",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(5, min(int(timeout), 60))) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = _api_error_detail(exc.read().decode("utf-8", errors="ignore"))
+        finally:
+            exc.close()
+        if exc.code == 403 and detail == "服务器返回了网页防护页":
+            detail = (
+                "服务器拒绝了模型列表请求（网页防护页）。请确认 API Base 是服务商提供的 API 地址"
+                "（通常以 /v1 结尾），并检查该服务是否限制当前 IP；也可手动填写模型名后测试连接。"
+            )
+        return {"ok": False, "models": [], "error": f"获取模型失败：HTTP {exc.code} {detail}".strip()}
+    except Exception as exc:
+        return {"ok": False, "models": [], "error": f"获取模型失败：{exc}"}
+
+    entries = payload.get("data", payload.get("models", [])) if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        return {"ok": False, "models": [], "error": "模型接口返回格式无效"}
+    models: list[str] = []
+    for entry in entries:
+        if isinstance(entry, str):
+            model_id = entry.strip()
+        elif isinstance(entry, dict):
+            model_id = str(entry.get("id") or entry.get("name") or entry.get("model") or "").strip()
+        else:
+            model_id = ""
+        if model_id and model_id not in models:
+            models.append(model_id)
+    if not models:
+        return {"ok": False, "models": [], "error": "接口没有返回可用模型"}
+    return {"ok": True, "models": models}
+
+
+def _api_error_detail(body: str) -> str:
+    """Extract a concise, safe error summary from an API error response."""
+    text = str(body or "").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        if "<html" in text.lower() or "<!doctype html" in text.lower():
+            return "服务器返回了网页防护页"
+        return re.sub(r"\s+", " ", text)[:200]
+
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("detail") or error.get("code")
+        else:
+            message = error or payload.get("message") or payload.get("detail")
+        if message:
+            return re.sub(r"\s+", " ", str(message)).strip()[:200]
+    return "接口返回错误"
+
+
 def call_remote_llm(
     message: str,
     history: list[tuple[str, str]] | None = None,
@@ -172,12 +258,17 @@ def call_remote_llm(
     api_message = sanitize_message_for_api(message)
     messages.append({"role": "user", "content": api_message})
 
-    payload = json.dumps({
+    payload_data = {
         "model": data["model"],
         "messages": messages,
         "temperature": data["temperature"],
         "max_tokens": data["max_tokens"],
-    }).encode("utf-8")
+    }
+    # The field is omitted unless explicitly enabled, preserving compatibility
+    # with providers that only implement the baseline chat-completions schema.
+    if data.get("reasoning_enabled"):
+        payload_data["reasoning"] = {"effort": data["reasoning_effort"]}
+    payload = json.dumps(payload_data).encode("utf-8")
 
     headers = {
         "Content-Type": "application/json",

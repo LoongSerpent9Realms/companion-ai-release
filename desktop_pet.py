@@ -36,6 +36,7 @@ from _paths import (
 )
 
 runtime_python_exe = getattr(path_helpers, "runtime_python_exe", lambda root=None, create=True: python_exe())
+runtime_subprocess_env = getattr(path_helpers, "runtime_subprocess_env", lambda python=None: None)
 external_site_packages = getattr(path_helpers, "external_site_packages", lambda: [])
 ensure_external_site_packages = getattr(path_helpers, "ensure_external_site_packages", lambda: None)
 ensure_external_site_packages()
@@ -278,6 +279,7 @@ except Exception as exc:
             text=True,
             timeout=30,
             creationflags=CREATE_NO_WINDOW,
+            env=runtime_subprocess_env(runtime_python_exe(create=False)),
         )
         if result.returncode == 0:
             version = result.stdout.strip()
@@ -402,6 +404,7 @@ except Exception as exc:
             text=True,
             timeout=30,
             creationflags=CREATE_NO_WINDOW,
+            env=runtime_subprocess_env(py),
         )
         if result.returncode != 0:
             error_detail = (result.stderr or result.stdout or "PyTorch not installed").strip()
@@ -493,6 +496,7 @@ except Exception as exc:
             text=True,
             timeout=30,
             creationflags=CREATE_NO_WINDOW,
+            env=runtime_subprocess_env(runtime_python_exe(create=False)),
         )
         info = json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else {"installed": False}
     except Exception as exc:
@@ -1292,6 +1296,7 @@ except Exception:
             text=True,
             timeout=30,
             creationflags=CREATE_NO_WINDOW,
+            env=runtime_subprocess_env(runtime_python_exe(create=False)),
         )
         if result.returncode == 0:
             info = json.loads(result.stdout)
@@ -1801,6 +1806,8 @@ class EmbeddedModelLayer:
         self._use_electron = False
         self._last_geometry: tuple[int, int, int, int] | None = None
         self._last_visible: bool | None = None
+        self._last_cursor: tuple[int, int] | None = None
+        self._last_cursor_write_at: float = 0.0
         self._last_electron_geometry: tuple[int, int, int, int] | None = None
         self._electron_moved_at: float = 0.0
         self._suppress_tk_sync_until: float = 0.0
@@ -1933,6 +1940,12 @@ class EmbeddedModelLayer:
         except Exception:
             return 500, 300, int(BASE_W), int(BASE_H)
 
+    def _current_cursor(self) -> tuple[int, int] | None:
+        try:
+            return int(self.root.winfo_pointerx()), int(self.root.winfo_pointery())
+        except Exception:
+            return None
+
     def sync(self, visible: bool = True, force: bool = False) -> None:
         if not self._running:
             return
@@ -1941,6 +1954,7 @@ class EmbeddedModelLayer:
             if self._use_electron:
                 self._sync_from_electron()
             geometry = self._current_geometry()
+            cursor = None if self._use_electron else self._current_cursor()
             tk_is_moving = now < self._suppress_tk_sync_until
             if not tk_is_moving or force:
                 state = {
@@ -1954,13 +1968,19 @@ class EmbeddedModelLayer:
                     "closed": False,
                     "updated_at": now,
                 }
-                if force or geometry != self._last_geometry or visible != self._last_visible:
+                if cursor:
+                    state["cursor"] = {"x": cursor[0], "y": cursor[1]}
+                cursor_changed = cursor is not None and cursor != self._last_cursor and (now - self._last_cursor_write_at) >= 0.03
+                if force or geometry != self._last_geometry or visible != self._last_visible or cursor_changed:
                     self.geometry_file.parent.mkdir(parents=True, exist_ok=True)
                     tmp = self.geometry_file.with_suffix(".tmp")
                     tmp.write_text(json.dumps(state), encoding="utf-8")
                     tmp.replace(self.geometry_file)
                     self._last_geometry = geometry
                     self._last_visible = visible
+                    if cursor:
+                        self._last_cursor = cursor
+                        self._last_cursor_write_at = now
             self._sync_browser_window(geometry, visible)
             if not self._use_electron:
                 try:
@@ -4328,6 +4348,8 @@ def run_model_layer_process(style: str, geometry_file: str) -> None:
     def _sync_loop() -> None:
         last_geometry = None
         last_visible = None
+        last_cursor: tuple[int, int] | None = None
+        last_cursor_sent_at = 0.0
         force_show_until = time.time() + 6
         while True:
             state = _read_model_layer_state(state_path, style)
@@ -4364,6 +4386,34 @@ def run_model_layer_process(style: str, geometry_file: str) -> None:
                 except Exception:
                     pass
                 last_visible = visible
+            cursor_raw = state.get("cursor") if isinstance(state, dict) else None
+            cursor = None
+            if isinstance(cursor_raw, dict):
+                try:
+                    cursor = (int(cursor_raw.get("x", 0)), int(cursor_raw.get("y", 0)))
+                except Exception:
+                    cursor = None
+            now = time.time()
+            if cursor and (cursor != last_cursor or (now - last_cursor_sent_at) >= 0.12):
+                payload = {
+                    "cursor": {"x": cursor[0], "y": cursor[1]},
+                    "windowBounds": {
+                        "x": geometry[0],
+                        "y": geometry[1],
+                        "width": geometry[2],
+                        "height": geometry[3],
+                    },
+                }
+                try:
+                    window.evaluate_js(
+                        "window.postMessage("
+                        + json.dumps({"type": "cursor-position", "payload": payload})
+                        + ", '*');"
+                    )
+                    last_cursor = cursor
+                    last_cursor_sent_at = now
+                except Exception:
+                    pass
             time.sleep(0.08)
 
     def _on_start() -> None:

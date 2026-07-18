@@ -33,6 +33,7 @@ DATASET_IMPORTS = [
 DATASET_INSTALL_CMD = "pip install " + " ".join(DATASET_PACKAGES)
 
 runtime_python_exe = getattr(path_helpers, "runtime_python_exe", lambda root=None, create=True: python_exe())
+runtime_subprocess_env = getattr(path_helpers, "runtime_subprocess_env", lambda python=None: None)
 
 
 @dataclass
@@ -114,6 +115,7 @@ print(json.dumps({"missing": missing, "versions": versions}, ensure_ascii=False)
             text=True,
             timeout=45,
             creationflags=CREATE_NO_WINDOW,
+            env=runtime_subprocess_env(py),
         )
     except Exception as exc:
         return DependencyStatus(False, f"检测失败：{exc}", py)
@@ -150,6 +152,7 @@ def install_dataset_dependencies() -> DependencyStatus:
             text=True,
             timeout=900,
             creationflags=CREATE_NO_WINDOW,
+            env=runtime_subprocess_env(py),
         )
     except Exception as exc:
         return DependencyStatus(False, f"安装失败：{exc}", py)
@@ -159,6 +162,20 @@ def install_dataset_dependencies() -> DependencyStatus:
     if status.ok:
         refresh_external_site_packages()
         return DependencyStatus(True, f"安装并验证完成：{status.detail}", py, installed=True)
+    if "No module named 'torchgen'" in status.detail:
+        return DependencyStatus(
+            False,
+            "pip 安装完成，但 PyTorch 安装不完整（缺少 torchgen）。"
+            "请先在设置中的“PyTorch”组件执行安装/修复，然后重试数据集工具。",
+            py,
+        )
+    if "No module named 'torch'" in status.detail:
+        return DependencyStatus(
+            False,
+            "pip 安装完成，但 ModelScope 需要 PyTorch。"
+            "请先在设置中安装 PyTorch，然后重试数据集工具。",
+            py,
+        )
     return DependencyStatus(False, f"pip 安装完成，但验证失败：{status.detail}", py)
 
 

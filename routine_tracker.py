@@ -80,10 +80,9 @@ def reset_routine_encryption_key() -> str:
 def routine_security_text() -> str:
     load_routine()
     return (
-        "作息记录加密：已开启\n"
-        f"数据文件：{ROUTINE_FILE}\n"
-        f"密钥文件：{ROUTINE_KEY_FILE}\n"
-        "说明：routine.json 使用本机专用密钥加密并带校验；如果密钥不匹配或文件被篡改，程序会清空并重建作息记录。"
+        "作息记录加密：默认开启\n"
+        "说明：记录会使用本机专用密钥加密并进行完整性校验；"
+        "如果密钥不匹配或记录被篡改，程序会清空并重建作息记录。"
     )
 
 

@@ -80,6 +80,21 @@ def is_available() -> bool:
         _HAS_EDGE_TTS = True
         return True
     except ImportError:
+        pass
+    # 仍然失败：可能是运行时 venv 的 site-packages 尚未加入 sys.path
+    try:
+        import sys
+        from _paths import external_site_packages
+        for sp in external_site_packages():
+            sp_str = str(sp)
+            if sp_str not in sys.path:
+                sys.path.insert(0, sp_str)
+        importlib.invalidate_caches()
+        import edge_tts as _et2
+        edge_tts = _et2
+        _HAS_EDGE_TTS = True
+        return True
+    except ImportError:
         return False
 
 
@@ -182,6 +197,48 @@ async def _synthesize_async(
     return output_path
 
 
+def _synthesize_subprocess(
+    text: str,
+    voice: str = DEFAULT_VOICE,
+    rate: str = DEFAULT_RATE,
+    pitch: str = DEFAULT_PITCH,
+    volume: str = DEFAULT_VOLUME,
+    output_path: Optional[Path] = None,
+) -> Path:
+    """使用子进程调用 runtime_python 合成语音（打包后 edge_tts 不可直接 import 时的回退方案）"""
+    ensure_cache_dir()
+
+    if output_path is None:
+        cache_key = get_cache_key(text, voice, rate, pitch)
+        output_path = TTS_CACHE_DIR / f"{cache_key}.mp3"
+
+    if output_path.exists():
+        return output_path
+
+    code = f'''
+import asyncio, json, sys
+async def main():
+    import edge_tts
+    comm = edge_tts.Communicate(text={json.dumps(text)}, voice={json.dumps(voice)}, rate={json.dumps(rate)}, pitch={json.dumps(pitch)}, volume={json.dumps(volume)})
+    await comm.save({json.dumps(str(output_path))})
+asyncio.run(main())
+'''
+    try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            [runtime_python_exe(create=False), "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            creationflags=creationflags,
+        )
+        if result.returncode == 0 and output_path.exists():
+            return output_path
+        raise RuntimeError(result.stderr.strip() or f"子进程合成失败 (exit {result.returncode})")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("语音合成超时")
+
+
 def synthesize(
     text: str,
     voice: str = DEFAULT_VOICE,
@@ -210,31 +267,35 @@ def synthesize(
         if cached:
             return cached
 
-    # 在新线程中运行异步代码
-    result = {}
-    error = {}
+    # 优先直接 import 调用；不可用时回退到子进程
+    if is_available():
+        result = {}
+        error = {}
 
-    def run_async():
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        def run_async():
             try:
-                result["path"] = loop.run_until_complete(
-                    _synthesize_async(text, voice, rate, pitch, volume)
-                )
-            finally:
-                loop.close()
-        except Exception as e:
-            error["exc"] = e
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    result["path"] = loop.run_until_complete(
+                        _synthesize_async(text, voice, rate, pitch, volume)
+                    )
+                finally:
+                    loop.close()
+            except Exception as e:
+                error["exc"] = e
 
-    thread = threading.Thread(target=run_async)
-    thread.start()
-    thread.join()
+        thread = threading.Thread(target=run_async)
+        thread.start()
+        thread.join()
 
-    if error:
-        raise error["exc"]
+        if error:
+            raise error["exc"]
 
-    return result["path"]
+        return result["path"]
+    else:
+        # edge_tts 在打包环境中不可直接 import，用子进程回退
+        return _synthesize_subprocess(text, voice, rate, pitch, volume)
 
 
 def clear_cache() -> int:

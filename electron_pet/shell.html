@@ -419,6 +419,7 @@
     let dockEdge = "";
     let resizeRefreshTimer = null;
     let viewerLoaded = false;
+    let viewerSuspended = false;
     let edgeCapture = false;
     let edgeDragging = false;
     let edgeDragMoved = false;
@@ -431,6 +432,7 @@
     }
 
     function refreshViewer(showTip = false) {
+      if (viewerSuspended) return;
       viewer.src = viewerUrlWithReloadToken();
       if (showTip) showSpeech(t("refreshed"), 1200);
     }
@@ -448,6 +450,21 @@
       viewerLoaded = true;
     });
     viewer.src = viewerUrl;
+
+    function suspendViewer() {
+      if (viewerSuspended) return;
+      viewerSuspended = true;
+      viewerLoaded = false;
+      // CSS hiding leaves Live2D/3D animation loops and GPU textures alive.
+      // Unloading the iframe releases those resources while the pet is inactive.
+      viewer.src = "about:blank";
+    }
+
+    function resumeViewer() {
+      if (!viewerSuspended) return;
+      viewerSuspended = false;
+      viewer.src = viewerUrlWithReloadToken();
+    }
 
     const idleLines = t("idleLines");
 
@@ -726,6 +743,10 @@
         else showSpeech(payload.text || "", 5000);
       } else if (payload.action === "refresh-viewer") {
         refreshViewer(true);
+      } else if (payload.action === "suspend-viewer") {
+        suspendViewer();
+      } else if (payload.action === "resume-viewer") {
+        resumeViewer();
       } else if (payload.action === "dock-state") {
         setDockState(Boolean(payload.docked), payload.edge || "");
       }

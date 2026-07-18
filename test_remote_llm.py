@@ -17,6 +17,25 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
     response_body: dict = {
         "choices": [{"message": {"content": "连接测试成功"}}],
     }
+    model_response_body: dict = {
+        "data": [{"id": "fake-model"}, {"id": "fake-model-mini"}],
+    }
+    model_response_raw: bytes | None = None
+
+    def do_GET(self) -> None:
+        self.__class__.requests.append({
+            "path": self.path,
+            "authorization": self.headers.get("Authorization", ""),
+            "payload": None,
+        })
+        body = self.__class__.model_response_raw or json.dumps(
+            self.__class__.model_response_body, ensure_ascii=False
+        ).encode("utf-8")
+        self.send_response(self.__class__.status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -48,6 +67,8 @@ class RemoteLlmTests(unittest.TestCase):
         import remote_llm
 
         cls.remote_llm = remote_llm
+        cls._saved_config_file = remote_llm.REMOTE_LLM_CONFIG_FILE
+        remote_llm.REMOTE_LLM_CONFIG_FILE = Path(cls._tmp.name) / "remote_llm_config.json"
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenAIHandler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -58,6 +79,7 @@ class RemoteLlmTests(unittest.TestCase):
         cls.server.shutdown()
         cls.thread.join(timeout=5)
         cls.server.server_close()
+        cls.remote_llm.REMOTE_LLM_CONFIG_FILE = cls._saved_config_file
         cls._tmp.cleanup()
 
     def setUp(self) -> None:
@@ -66,6 +88,10 @@ class RemoteLlmTests(unittest.TestCase):
         FakeOpenAIHandler.response_body = {
             "choices": [{"message": {"content": "远程模型回复"}}],
         }
+        FakeOpenAIHandler.model_response_body = {
+            "data": [{"id": "fake-model"}, {"id": "fake-model-mini"}],
+        }
+        FakeOpenAIHandler.model_response_raw = None
         config_path = Path(self.remote_llm.REMOTE_LLM_CONFIG_FILE)
         if config_path.exists():
             config_path.unlink()
@@ -100,6 +126,21 @@ class RemoteLlmTests(unittest.TestCase):
         self.assertEqual(payload["max_tokens"], 128)
         self.assertEqual(payload["messages"][0], {"role": "system", "content": "测试系统提示"})
         self.assertEqual(payload["messages"][-1], {"role": "user", "content": "你好"})
+        self.assertNotIn("reasoning", payload)
+
+    def test_call_remote_llm_sends_reasoning_only_when_enabled(self) -> None:
+        config = {**self.ready_config(), "reasoning_enabled": True, "reasoning_effort": "high"}
+
+        reply = self.remote_llm.call_remote_llm("请解题", config=config)
+
+        self.assertEqual(reply, "远程模型回复")
+        self.assertEqual(FakeOpenAIHandler.requests[0]["payload"]["reasoning"], {"effort": "high"})
+
+    def test_reasoning_config_is_normalized(self) -> None:
+        config = self.remote_llm._coerce_config({"reasoning_enabled": True, "reasoning_effort": "invalid"})
+
+        self.assertTrue(config["reasoning_enabled"])
+        self.assertEqual(config["reasoning_effort"], "medium")
 
     def test_connection_test_reports_success(self) -> None:
         result = self.remote_llm.test_remote_llm_connection(self.ready_config())
@@ -109,6 +150,26 @@ class RemoteLlmTests(unittest.TestCase):
         self.assertIn("latency_ms", result)
         payload = FakeOpenAIHandler.requests[0]["payload"]
         self.assertLessEqual(payload["max_tokens"], 64)
+
+    def test_model_listing_uses_models_endpoint_and_returns_ids(self) -> None:
+        result = self.remote_llm.list_available_models(self.api_base, "sk-test-secret")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["models"], ["fake-model", "fake-model-mini"])
+        self.assertEqual(FakeOpenAIHandler.requests[0]["path"], "/v1/models")
+        self.assertEqual(FakeOpenAIHandler.requests[0]["authorization"], "Bearer sk-test-secret")
+
+    def test_model_listing_hides_html_forbidden_page(self) -> None:
+        FakeOpenAIHandler.status_code = 403
+        FakeOpenAIHandler.model_response_raw = b"<!DOCTYPE html><html><body>Forbidden</body></html>"
+
+        result = self.remote_llm.list_available_models(self.api_base, "sk-test-secret")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("HTTP 403", result["error"])
+        self.assertIn("网页防护页", result["error"])
+        self.assertIn("手动填写模型名", result["error"])
+        self.assertNotIn("<!DOCTYPE", result["error"])
 
     def test_http_error_is_reported_without_raising(self) -> None:
         FakeOpenAIHandler.status_code = 401

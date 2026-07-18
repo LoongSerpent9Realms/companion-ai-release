@@ -13,6 +13,7 @@ from _paths import module_root, data_dir, python_exe
 from sensitive_json import read_sensitive_json
 
 runtime_python_exe = getattr(path_helpers, "runtime_python_exe", lambda root=None, create=True: python_exe())
+runtime_subprocess_env = getattr(path_helpers, "runtime_subprocess_env", lambda python=None: os.environ.copy())
 
 
 ROOT = module_root(__file__)
@@ -45,6 +46,19 @@ SEED_EXAMPLES = [
 ]
 
 
+def _requested_training_backend() -> str:
+    """Return the backend selected for a training worker.
+
+    ``COMPANION_ENABLE_GPU_TRAINING`` remains supported for older launchers.
+    New callers use the explicit backend so a DirectML request cannot quietly
+    run on the CPU.
+    """
+    backend = os.environ.get("COMPANION_TRAINING_BACKEND", "").strip().lower()
+    if backend in {"cpu", "cuda", "directml", "auto"}:
+        return backend
+    return "auto" if _gpu_training_enabled() else "cpu"
+
+
 def torch_info() -> dict:
     try:
         import torch
@@ -66,10 +80,11 @@ def torch_info() -> dict:
 
     gpu_available = bool(torch.cuda.is_available())
     hip_runtime = bool(getattr(torch.version, "hip", None))
-    requested_gpu = _gpu_training_enabled()
-    if requested_gpu and gpu_available:
+    requested_backend = _requested_training_backend()
+    requested_gpu = requested_backend != "cpu"
+    if requested_backend in {"auto", "cuda"} and gpu_available:
         device = "cuda"
-    elif requested_gpu and directml_available:
+    elif requested_backend in {"auto", "directml"} and directml_available:
         device = "directml"
     else:
         device = "cpu"
@@ -81,6 +96,7 @@ def torch_info() -> dict:
         "directml_available": directml_available,
         "directml_error": directml_error,
         "device": device,
+        "requested_backend": requested_backend,
         "gpu_training_enabled": requested_gpu,
         "cuda_device": torch.cuda.get_device_name(0) if gpu_available else "",
     }
@@ -93,16 +109,22 @@ def _gpu_training_enabled() -> bool:
 def best_torch_device():
     import torch
 
-    if not _gpu_training_enabled():
+    requested_backend = _requested_training_backend()
+    if requested_backend == "cpu":
         return torch.device("cpu"), "cpu"
-    if torch.cuda.is_available():
+    if requested_backend in {"auto", "cuda"} and torch.cuda.is_available():
         return torch.device("cuda"), "cuda"
-    try:
-        import torch_directml
+    if requested_backend == "cuda":
+        raise RuntimeError("已选择 CUDA 训练，但当前 PyTorch 未检测到可用的 CUDA 设备。")
+    if requested_backend in {"auto", "directml"}:
+        try:
+            import torch_directml
 
-        return torch_directml.device(), "directml"
-    except Exception:
-        return torch.device("cpu"), "cpu"
+            return torch_directml.device(), "directml"
+        except Exception as exc:
+            if requested_backend == "directml":
+                raise RuntimeError(f"已选择 DirectX 12 (DirectML) 训练，但 torch-directml 不可用：{exc}") from exc
+    return torch.device("cpu"), "cpu"
 
 
 def tokenize(text: str) -> list[str]:
@@ -165,7 +187,15 @@ def encode(text: str, vocab: dict[str, int], max_len: int = 48) -> list[int]:
 def train_motion_net(epochs: int = 120) -> dict:
     info = torch_info()
     if not info["available"]:
-        return {"ok": False, **info}
+        # The desktop app deliberately excludes PyTorch from its frozen main
+        # process.  The settings page installs it in the component venv, so
+        # run the command there instead of incorrectly reporting it missing.
+        if not os.environ.get("COMPANION_NEURAL_COMPONENT_WORKER"):
+            result = _run_component_worker("--train-motion-cpu", timeout=240)
+            if result.get("ok"):
+                return result
+            info["runtime_error"] = result.get("error", "组件虚拟环境不可用")
+        return {"ok": False, "error": info.get("runtime_error", info.get("error", "PyTorch 不可用")), **info}
 
     import torch
     import torch.nn as nn
@@ -184,6 +214,49 @@ def _worker_python() -> str:
         return python_exe()
     except Exception:
         return sys.executable
+
+
+def _run_component_worker(action: str, timeout: int = 90, payload: dict | None = None) -> dict:
+    """Run a neural command in the same venv used by the Settings page."""
+    worker = _worker_python()
+    env = runtime_subprocess_env(worker) or os.environ.copy()
+    env["COMPANION_NEURAL_COMPONENT_WORKER"] = "1"
+    env["COMPANION_TRAINING_BACKEND"] = "cpu"
+    env["PYTHONIOENCODING"] = "utf-8"
+    try:
+        proc = subprocess.run(
+            [worker, str(Path(__file__).resolve()), action],
+            cwd=str(ROOT),
+            env=env,
+            input=json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"组件虚拟环境命令超时（{timeout}s）"}
+    except Exception as exc:
+        return {"ok": False, "error": f"组件虚拟环境命令启动失败：{exc}"}
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    try:
+        data = json.loads(stdout.splitlines()[-1] if stdout else "{}")
+    except Exception:
+        return {
+            "ok": False,
+            "error": "组件虚拟环境没有返回有效 JSON",
+            "stdout": stdout[-1200:],
+            "stderr": stderr[-1200:],
+        }
+    if proc.returncode != 0:
+        data.setdefault("ok", False)
+        data.setdefault("error", "组件虚拟环境命令执行失败")
+    if stderr:
+        data.setdefault("stderr", stderr[-1200:])
+    data.setdefault("worker_python", worker)
+    return data
 
 
 def _read_gpu_state() -> dict:
@@ -254,7 +327,9 @@ def _gpu_state_blocks(action: str, fingerprint: dict) -> dict | None:
     return blocked
 
 
-def _run_gpu_worker(action: str, timeout: int = 180) -> dict:
+def _run_gpu_worker(action: str, timeout: int = 180, backend: str = "auto") -> dict:
+    if backend not in {"auto", "cuda", "directml"}:
+        return {"ok": False, "error": f"不支持的训练后端：{backend}"}
     worker = _worker_python()
     fingerprint = _runtime_torch_fingerprint(worker)
     blocked = _gpu_state_blocks(action, fingerprint)
@@ -272,8 +347,9 @@ def _run_gpu_worker(action: str, timeout: int = 180) -> dict:
             "worker_python": worker,
             "torch_runtime": fingerprint,
         }
-    env = os.environ.copy()
+    env = runtime_subprocess_env(worker) or os.environ.copy()
     env["COMPANION_ENABLE_GPU_TRAINING"] = "1"
+    env["COMPANION_TRAINING_BACKEND"] = backend
     env["PYTHONIOENCODING"] = "utf-8"
     cmd = [worker, str(Path(__file__).resolve()), action]
     try:
@@ -330,8 +406,9 @@ def gpu_self_check_isolated() -> dict:
     return _run_gpu_worker("--gpu-check", timeout=90)
 
 
-def train_motion_net_gpu_isolated() -> dict:
-    return _run_gpu_worker("--train-motion-gpu", timeout=240)
+def train_motion_net_gpu_isolated(backend: str = "auto") -> dict:
+    """Train the small local motion model in an isolated GPU process."""
+    return _run_gpu_worker("--train-motion-gpu", timeout=240, backend=backend)
 
 
 def train_from_dataset(
@@ -361,7 +438,26 @@ def train_from_dataset(
     """
     info = torch_info()
     if not info["available"]:
-        return {"ok": False, **info}
+        if not os.environ.get("COMPANION_NEURAL_COMPONENT_WORKER"):
+            result = _run_component_worker(
+                "--train-dataset",
+                timeout=600,
+                payload={
+                    "dataset_examples": dataset_examples,
+                    "labels": labels,
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "lr": lr,
+                    "val_split": val_split,
+                    "early_stop_patience": early_stop_patience,
+                    "model_tag": model_tag,
+                    "merge_seed": merge_seed,
+                },
+            )
+            if result.get("ok"):
+                return result
+            info["runtime_error"] = result.get("error", "组件虚拟环境不可用")
+        return {"ok": False, "error": info.get("runtime_error", info.get("error", "PyTorch 不可用")), **info}
 
     examples = [(item["text"], item["label"]) for item in dataset_examples if item.get("text") and item.get("label")]
 
@@ -584,6 +680,15 @@ def predict_with_model(text: str, model_file: Path) -> dict:
 
 def neural_status() -> dict:
     info = torch_info()
+    # When the app is packaged, the main process cannot import optional native
+    # wheels. Ask the component venv directly; this is also the interpreter
+    # that Settings uses to display the installed PyTorch status.
+    if not info["available"] and not os.environ.get("COMPANION_NEURAL_COMPONENT_WORKER"):
+        result = _run_component_worker("--status")
+        runtime_status = result.get("status")
+        if result.get("ok") and isinstance(runtime_status, dict):
+            runtime_status["runtime_python"] = result.get("worker_python", "")
+            return runtime_status
     status = {"torch": info, "model_exists": MODEL_FILE.exists(), "model": str(MODEL_FILE)}
     if MODEL_FILE.exists() and info["available"]:
         try:
@@ -649,6 +754,23 @@ def _main() -> int:
             result = _gpu_check_worker()
         elif action == "--train-motion-gpu":
             result = train_motion_net()
+        elif action == "--train-motion-cpu":
+            result = train_motion_net()
+        elif action == "--train-dataset":
+            payload = json.loads(sys.stdin.read() or "{}")
+            result = train_from_dataset(
+                dataset_examples=payload.get("dataset_examples", []),
+                labels=payload.get("labels"),
+                epochs=payload.get("epochs", 50),
+                batch_size=payload.get("batch_size", 64),
+                lr=payload.get("lr", 0.005),
+                val_split=payload.get("val_split", 0.15),
+                early_stop_patience=payload.get("early_stop_patience", 5),
+                model_tag=payload.get("model_tag", "dataset_model"),
+                merge_seed=payload.get("merge_seed", True),
+            )
+        elif action == "--status":
+            result = {"ok": True, "status": neural_status()}
         else:
             result = {"ok": False, "error": f"unknown action: {action}"}
     except Exception as exc:

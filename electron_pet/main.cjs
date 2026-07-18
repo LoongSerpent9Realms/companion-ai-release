@@ -24,6 +24,7 @@ let chatHistory = [];
 let chatBusy = false;
 let seenMessageIds = new Set();
 let nextAutoTalkAt = 0;
+let viewerSuspended = false;
 
 const WEB_URL = "http://127.0.0.1:59137";
 const AUTO_PET_TALK_MIN_SECONDS = 45;
@@ -36,6 +37,9 @@ const EDGE_UNDOCK_DRAG_THRESHOLD = 42;
 const EDGE_STRIP_THICKNESS = 12;
 const EDGE_STRIP_LENGTH = 170;
 const EDGE_HINT_SPACE = 250;
+const STATE_SYNC_INTERVAL_MS = 350;
+const CURSOR_SYNC_INTERVAL_MS = 80;
+const MAX_SEEN_MESSAGE_IDS = 256;
 const I18N = {
   "zh-CN": {
     appName: "AI陪伴桌宠",
@@ -269,8 +273,18 @@ function appendPetMessage(text, kind = "talk", replyTo = "") {
   };
   if (message.text) data.messages.push(message);
   safeWriteTalkBus(data);
-  seenMessageIds.add(message.id);
+  rememberSeenMessage(message.id);
   return message;
+}
+
+function rememberSeenMessage(messageId) {
+  if (!messageId) return;
+  seenMessageIds.add(messageId);
+  while (seenMessageIds.size > MAX_SEEN_MESSAGE_IDS) {
+    const oldest = seenMessageIds.values().next().value;
+    if (!oldest) break;
+    seenMessageIds.delete(oldest);
+  }
 }
 
 function cleanShortPetText(text, limit = 34) {
@@ -332,7 +346,7 @@ function startTalkLoop() {
     const data = pruneTalkBus(safeReadTalkBus());
     for (const message of data.messages || []) {
       if (!message.id || seenMessageIds.has(message.id)) continue;
-      seenMessageIds.add(message.id);
+      rememberSeenMessage(message.id);
       if (message.from_id === instanceId()) continue;
       const sender = message.from_name || t("otherPet");
       const text = String(message.text || "").trim();
@@ -529,6 +543,13 @@ function sendDockState(edge = "") {
   });
 }
 
+function setViewerSuspended(suspended) {
+  const next = Boolean(suspended);
+  if (viewerSuspended === next || !win || win.isDestroyed()) return;
+  viewerSuspended = next;
+  win.webContents.send("pet-action", { action: next ? "suspend-viewer" : "resume-viewer" });
+}
+
 function setWindowMousePassthrough(active) {
   if (!win || win.isDestroyed()) return;
   const next = Boolean(active);
@@ -618,6 +639,7 @@ function dockPetWindow(edge) {
   const expanded = win.getBounds();
   const collapsed = collapsedBoundsFor(edge, expanded);
   isDocked = true;
+  setViewerSuspended(true);
   dockMouseCaptured = false;
   win.setBounds(collapsed, false);
   setWindowMousePassthrough(true);
@@ -637,6 +659,7 @@ function undockPetWindow() {
   if (!win || win.isDestroyed()) return;
   const expanded = expandedBoundsFromState(readState());
   isDocked = false;
+  setViewerSuspended(false);
   dockMouseCaptured = false;
   setWindowMousePassthrough(false);
   win.setBounds(expanded, false);
@@ -653,7 +676,6 @@ function undockPetWindow() {
     electron_moved: true
   });
   sendDockState("");
-  scheduleViewerRefresh();
 }
 
 function applyState(state) {
@@ -676,10 +698,12 @@ function applyState(state) {
     win.setBounds(nextBounds, false);
   }
   if (state.visible === false) {
+    setViewerSuspended(true);
     if (win.isVisible()) win.hide();
   } else if (!win.isVisible()) {
     win.showInactive();
   }
+  setViewerSuspended(state.visible === false || isDocked);
   setWindowMousePassthrough(isDocked && !dockMouseCaptured && !isDragging);
   sendDockState(isDocked ? state.dock_edge : "");
   const nextTopmost = state.always_on_top !== false;
@@ -723,9 +747,9 @@ function resizePetBySteps(delta) {
 }
 
 function scheduleViewerRefresh() {
-  if (!win || win.isDestroyed()) return;
+  if (!win || win.isDestroyed() || viewerSuspended) return;
   setTimeout(() => {
-    if (!win || win.isDestroyed()) return;
+    if (!win || win.isDestroyed() || viewerSuspended) return;
     win.webContents.send("pet-action", { action: "refresh-viewer" });
   }, 560);
 }
@@ -757,24 +781,25 @@ function setLaunchAtLoginEnabled(enabled) {
 }
 
 function hidePetWindow() {
+  setViewerSuspended(true);
   if (win && !win.isDestroyed()) win.hide();
   writeState({ visible: false, closed: false });
 }
 
 function startSync() {
   if (syncTimer) clearInterval(syncTimer);
-  syncTimer = setInterval(() => applyState(readState()), 80);
+  syncTimer = setInterval(() => applyState(readState()), STATE_SYNC_INTERVAL_MS);
 }
 
 function startCursorTracking() {
   if (cursorTimer) clearInterval(cursorTimer);
   cursorTimer = setInterval(() => {
-    if (!win || win.isDestroyed() || !win.webContents) return;
+    if (!win || win.isDestroyed() || !win.webContents || !win.isVisible()) return;
     win.webContents.send("cursor-position", {
       cursor: screen.getCursorScreenPoint(),
       windowBounds: win.getBounds()
     });
-  }, 33);
+  }, CURSOR_SYNC_INTERVAL_MS);
 }
 
 function buildContextMenu() {
@@ -1066,7 +1091,8 @@ function createWindow() {
       webviewTag: false,
       webSecurity: false,
       allowRunningInsecureContent: true,
-      devTools: true
+      backgroundThrottling: true,
+      devTools: false
     }
   });
 

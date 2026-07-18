@@ -222,6 +222,10 @@ def _copy_bundled_resources() -> None:
     official_src = meipass / "official_site.html"
     if official_src.is_file():
         copy_file_best_effort(official_src, base / "official_site.html")
+    for icon_name in ("ai_icon.ico", "pet_icon.ico"):
+        icon_src = meipass / icon_name
+        if icon_src.is_file():
+            copy_file_best_effort(icon_src, base / icon_name)
     electron_pet_src = meipass / "electron_pet"
     if electron_pet_src.is_dir():
         copy_tree_best_effort(electron_pet_src, base / "electron_pet", overwrite=True)
@@ -248,15 +252,23 @@ def _copy_bundled_resources() -> None:
     marker.write_text("ok", encoding="utf-8")
 
 
-def open_web_later() -> None:
-    time.sleep(1.2)
-    webbrowser.open(WEB_URL)
+def open_web_when_ready(timeout: float = 60.0) -> None:
+    """Open the console only after its local HTTP server accepts requests."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _is_web_running():
+            webbrowser.open(WEB_URL)
+            return
+        time.sleep(0.25)
 
 
 def run_web() -> None:
     os.chdir(ROOT)
+    if _is_web_running():
+        webbrowser.open(WEB_URL)
+        return
     write_pid("web")
-    threading.Thread(target=open_web_later, daemon=True).start()
+    threading.Thread(target=open_web_when_ready, daemon=True).start()
     try:
         import app
         app.main()
@@ -433,6 +445,64 @@ def stop_all() -> None:
     _stop_companion_render_processes()
 
 
+def health_report() -> dict:
+    """Print a cross-platform health report without starting servers.
+
+    Reads launcher pid files, pings the running web server (if any), and
+    reports version/port/data directory/process status. Works on Windows,
+    Linux and macOS.
+    """
+    def _read_pid(name: str) -> int:
+        try:
+            return int(pid_file(name).read_text(encoding="utf-8").strip())
+        except Exception:
+            return 0
+
+    def _pid_alive(pid: int) -> bool:
+        if not pid or pid <= 0:
+            return False
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["tasklist", "/fi", f"PID eq {pid}", "/fo", "csv", "/nh"],
+                    capture_output=True, timeout=2,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                return True
+            except Exception:
+                return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+        except Exception:
+            return False
+
+    web_pid = _read_pid("web")
+    pet_pid = _read_pid("pet")
+    web_responds = _is_web_running()
+
+    try:
+        from app import current_app_version, PORT, HOST, ALLOW_LAN, DATA_DIR
+    except Exception:
+        current_app_version = lambda: "unknown"  # noqa: E731
+        PORT, HOST, ALLOW_LAN, DATA_DIR = 59137, "127.0.0.1", False, ""
+
+    report = {
+        "ok": True,
+        "version": current_app_version(),
+        "host": HOST,
+        "port": PORT,
+        "mode": "lan" if ALLOW_LAN or HOST in {"0.0.0.0", "::"} else "local",
+        "data_dir": str(DATA_DIR),
+        "web_server": {"responding": web_responds, "pid": web_pid, "alive": _pid_alive(web_pid)},
+        "pet": {"pid": pet_pid, "alive": _pid_alive(pet_pid)},
+    }
+    report["status"] = "running" if web_responds else ("stale_pid" if web_pid else "stopped")
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Companion AI launcher")
     parser.add_argument("--web", action="store_true", help="start web app and open browser")
@@ -440,7 +510,13 @@ def main() -> None:
     parser.add_argument("--style", choices=sorted(PET_STYLES.keys()), default="auto", help="desktop pet style")
     parser.add_argument("--no-manager-tray", action="store_true", help="do not start the launcher management tray")
     parser.add_argument("--stop", action="store_true", help="stop Companion AI processes")
+    parser.add_argument("--health", action="store_true", help="print JSON health report and exit")
     args = parser.parse_args()
+
+    if args.health:
+        import json
+        print(json.dumps(health_report(), ensure_ascii=False, indent=2))
+        return
 
     _copy_bundled_resources()
 
